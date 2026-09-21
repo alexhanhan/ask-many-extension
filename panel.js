@@ -14,7 +14,11 @@ const STORE_ORDER_KEY = 'askmany:order';
 const STORE_LAYOUT_KEY = 'askmany:layout';
 const STORE_JUDGE_KEY = 'askmany:judge';
 const STORE_AUTO_JUDGE_KEY = 'askmany:auto_judge';
+const STORE_JUDGE_ASK_KEY = 'askmany:judge_ask';
+const STORE_JUDGE_COMPARE_KEY = 'askmany:judge_compare';
 const STORE_SIDEBAR_COLLAPSED_KEY = 'askmany:sidebar_collapsed';
+const STORE_INPUT_HEIGHT_KEY = 'askmany:input_height';
+const STORE_COL_RATIOS_KEY = 'askmany:col_ratios';
 const state = {
   enabled: new Set(),
   order: [], // siteId[] 自定义排序数组
@@ -25,10 +29,76 @@ const state = {
   collapsed: new Set(), // siteId[]
   maximized: null, // siteId | null
   sidebarCollapsed: false, // 侧边栏是否收起
-  judgeId: null, // siteId 担任对比裁判，不参与同问，作答完毕后接收提示词
+  judgeId: null, // siteId 担任对比裁判
   autoJudge: true, // 其他模型完成后自动派发给裁判
+  judgeAnswersQuestion: false, // 裁判是否参与第一轮同问
+  judgeIncludedInComparison: false, // 是否将裁判第一轮回答纳入对比
   judgePrompt: '', // 最近一次生成的对比提示词
+  judgePromptJudgeId: null, // 最近一次对比提示词绑定的裁判，避免切换裁判后错派
+  currentRun: null, // 当前一轮提问的参与快照与已收集回答
+  lockedSites: new Set(), // 正在生成裁决的站点，避免新一轮并发写入同一 iframe
+  inputHeight: null, // 底部输入框高度（px）
+  colRatios: {}, // { [siteId]: number } 各列的相对 flex 比例或宽度
 };
+
+function startPointerDrag(e, { bodyClass, activeElement, onMove, onEnd }) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return false;
+
+  const target = e.currentTarget;
+  const pointerId = e.pointerId;
+  let active = true;
+  let pendingEvent = null;
+  let animationFrame = 0;
+
+  const flushMove = () => {
+    animationFrame = 0;
+    if (!pendingEvent) return;
+    const nextEvent = pendingEvent;
+    pendingEvent = null;
+    onMove(nextEvent);
+  };
+
+  const handleMove = (ev) => {
+    if (!active || ev.pointerId !== pointerId) return;
+    pendingEvent = ev;
+    if (!animationFrame) animationFrame = requestAnimationFrame(flushMove);
+  };
+
+  const finish = (ev) => {
+    if (!active || (ev?.pointerId != null && ev.pointerId !== pointerId)) return;
+    active = false;
+    if (animationFrame) cancelAnimationFrame(animationFrame);
+    if (pendingEvent) onMove(pendingEvent);
+    pendingEvent = null;
+    animationFrame = 0;
+
+    target.removeEventListener('pointermove', handleMove);
+    target.removeEventListener('pointerup', finish);
+    target.removeEventListener('pointercancel', finish);
+    target.removeEventListener('lostpointercapture', finish);
+    window.removeEventListener('blur', finish);
+    document.body.classList.remove(bodyClass);
+    activeElement?.classList.remove('is-active');
+
+    try {
+      if (target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
+    } catch (_) {
+      // Pointer capture may already be gone after cancellation or window blur.
+    }
+    onEnd?.();
+  };
+
+  e.preventDefault();
+  target.addEventListener('pointermove', handleMove);
+  target.addEventListener('pointerup', finish);
+  target.addEventListener('pointercancel', finish);
+  target.addEventListener('lostpointercapture', finish);
+  window.addEventListener('blur', finish);
+  document.body.classList.add(bodyClass);
+  activeElement?.classList.add('is-active');
+  target.setPointerCapture(pointerId);
+  return true;
+}
 
 /*
  * 附件走 base64 经 sendMessage 传给 content script（File 对象无法序列化）。
@@ -161,22 +231,229 @@ async function saveOrder() {
 }
 
 function applyOrder() {
-  // 1. 设置侧栏项和列的 CSS order
-  state.order.forEach((id, idx) => {
-    const item = document.getElementById(`item-${id}`);
-    if (item) item.style.order = String(idx);
+  const main = $('#cols');
+  const visible = state.order.filter((id) => state.enabled.has(id));
+
+  // 1. 让 main 内的列 DOM 顺序与 visible 保持一致，偶数位给 col，奇数位留给 resizer
+  visible.forEach((id, idx) => {
     const col = document.getElementById(`col-${id}`);
-    if (col) col.style.order = String(idx);
+    if (col && main) {
+      col.style.order = String(idx * 2);
+      main.appendChild(col);
+    }
   });
 
   // 2. 根据当前启用（可见）的列更新左移/右移按钮的禁用状态
-  const visible = state.order.filter((id) => state.enabled.has(id));
   visible.forEach((id, idx) => {
     const leftBtn = document.getElementById(`btn-left-${id}`);
     const rightBtn = document.getElementById(`btn-right-${id}`);
     if (leftBtn) leftBtn.disabled = (idx === 0);
     if (rightBtn) rightBtn.disabled = (idx === visible.length - 1);
   });
+
+  // 3. 设置侧栏项的 CSS order
+  state.order.forEach((id, idx) => {
+    const item = document.getElementById(`item-${id}`);
+    if (item) item.style.order = String(idx);
+  });
+
+  // 4. 应用已保存的列宽比例
+  applyColRatios();
+
+  // 5. 插入并绑定相邻列之间的拖拽分割器
+  syncColResizers();
+}
+
+function applyColRatios() {
+  const visible = state.order.filter((id) => state.enabled.has(id));
+  if (state.layout === 'scroll') {
+    for (const id of visible) {
+      const col = document.getElementById(`col-${id}`);
+      if (!col) continue;
+      const w = state.colRatios[id];
+      if (typeof w === 'number' && w >= 220) {
+        col.style.flex = `0 0 ${w}px`;
+        col.style.width = `${w}px`;
+      } else {
+        col.style.flex = '';
+        col.style.width = '';
+      }
+    }
+  } else {
+    for (const id of visible) {
+      const col = document.getElementById(`col-${id}`);
+      if (!col) continue;
+      const r = state.colRatios[id];
+      if (typeof r === 'number' && r > 0) {
+        col.style.flex = `${r.toFixed(4)} ${r.toFixed(4)} 0px`;
+        col.style.width = '';
+      } else {
+        col.style.flex = '';
+        col.style.width = '';
+      }
+    }
+  }
+}
+
+function syncColResizers() {
+  const main = $('#cols');
+  if (!main) return;
+
+  // 1. 移除旧的 resizer
+  main.querySelectorAll('.col-resizer').forEach((r) => r.remove());
+
+  // 2. 如果全屏聚焦单列，不显示 resizer
+  if (state.maximized) return;
+
+  // 3. 获取当前启用的可见列（按 order 顺序）
+  const visibleIds = state.order.filter((id) => state.enabled.has(id));
+  if (visibleIds.length <= 1) return;
+
+  // 4. 在相邻列之间插入 resizer
+  for (let i = 0; i < visibleIds.length - 1; i++) {
+    const leftId = visibleIds[i];
+    const rightId = visibleIds[i + 1];
+    const leftCol = document.getElementById(`col-${leftId}`);
+    const rightCol = document.getElementById(`col-${rightId}`);
+    if (!leftCol || !rightCol) continue;
+
+    const resizer = el('div', {
+      className: 'col-resizer',
+      title: '按住左右拖拽调节列宽，双击恢复等宽',
+    });
+    resizer.tabIndex = 0;
+    resizer.setAttribute('role', 'separator');
+    resizer.setAttribute('aria-orientation', 'vertical');
+    resizer.setAttribute('aria-label', `调整 ${A.byId(leftId)?.name || leftId} 与 ${A.byId(rightId)?.name || rightId} 的宽度`);
+    resizer.setAttribute('aria-valuemin', '0');
+    resizer.setAttribute('aria-valuemax', '100');
+    resizer.setAttribute('aria-valuenow', '50');
+    resizer.style.order = String(i * 2 + 1);
+    resizer.dataset.left = leftId;
+    resizer.dataset.right = rightId;
+
+    const isCollapsed = state.collapsed.has(leftId) || state.collapsed.has(rightId);
+    if (isCollapsed) {
+      resizer.classList.add('is-collapsed-adjacent');
+      resizer.tabIndex = -1;
+      resizer.setAttribute('aria-disabled', 'true');
+    } else {
+      resizer.setAttribute('aria-disabled', 'false');
+    }
+
+    leftCol.after(resizer);
+    bindColResizer(resizer, leftCol, rightCol, leftId, rightId);
+  }
+}
+
+function bindColResizer(resizer, leftCol, rightCol, leftId, rightId) {
+  const getColRatio = (col, id) => {
+    if (typeof state.colRatios[id] === 'number' && state.colRatios[id] > 0) {
+      return state.colRatios[id];
+    }
+    const ratio = Number.parseFloat(getComputedStyle(col).flexGrow);
+    return Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
+  };
+
+  const getMinWidth = (col) => {
+    const minWidth = Number.parseFloat(getComputedStyle(col).minWidth);
+    return Number.isFinite(minWidth) && minWidth > 0 ? minWidth : 0;
+  };
+
+  const syncAriaValue = () => {
+    const leftW = leftCol.getBoundingClientRect().width;
+    const rightW = rightCol.getBoundingClientRect().width;
+    const totalW = leftW + rightW;
+    if (!totalW) return;
+    const minLeft = Math.min(getMinWidth(leftCol), totalW / 2);
+    const minRight = Math.min(getMinWidth(rightCol), totalW / 2);
+    resizer.setAttribute('aria-valuemin', String(Math.round((minLeft / totalW) * 100)));
+    resizer.setAttribute('aria-valuemax', String(Math.round(((totalW - minRight) / totalW) * 100)));
+    resizer.setAttribute('aria-valuenow', String(Math.round((leftW / totalW) * 100)));
+  };
+
+  const applyPairWidths = (newLeftW, newRightW, totalRatio) => {
+    const totalW = newLeftW + newRightW;
+    if (state.layout === 'scroll') {
+      const leftW = Math.round(newLeftW);
+      const rightW = Math.round(newRightW);
+      leftCol.style.flex = `0 0 ${leftW}px`;
+      leftCol.style.width = `${leftW}px`;
+      rightCol.style.flex = `0 0 ${rightW}px`;
+      rightCol.style.width = `${rightW}px`;
+      state.colRatios[leftId] = leftW;
+      state.colRatios[rightId] = rightW;
+    } else {
+      const leftRatio = (newLeftW / totalW) * totalRatio;
+      const rightRatio = totalRatio - leftRatio;
+      leftCol.style.flex = `${leftRatio.toFixed(4)} 1 0px`;
+      rightCol.style.flex = `${rightRatio.toFixed(4)} 1 0px`;
+      state.colRatios[leftId] = Number(leftRatio.toFixed(4));
+      state.colRatios[rightId] = Number(rightRatio.toFixed(4));
+    }
+    syncAriaValue();
+  };
+
+  const resizeBy = (dx) => {
+    const startLeftW = leftCol.getBoundingClientRect().width;
+    const startRightW = rightCol.getBoundingClientRect().width;
+    const totalW = startLeftW + startRightW;
+    const minLeft = Math.min(getMinWidth(leftCol), totalW / 2);
+    const minRight = Math.min(getMinWidth(rightCol), totalW / 2);
+    const newLeftW = Math.max(minLeft, Math.min(totalW - minRight, startLeftW + dx));
+    const totalRatio = getColRatio(leftCol, leftId) + getColRatio(rightCol, rightId);
+    applyPairWidths(newLeftW, totalW - newLeftW, totalRatio);
+  };
+
+  resizer.addEventListener('pointerdown', (e) => {
+    if (state.collapsed.has(leftId) || state.collapsed.has(rightId)) return;
+    const startX = e.clientX;
+
+    const leftRect = leftCol.getBoundingClientRect();
+    const rightRect = rightCol.getBoundingClientRect();
+    const startLeftW = leftRect.width;
+    const startRightW = rightRect.width;
+    const totalW = startLeftW + startRightW;
+
+    const ratioLeftStart = getColRatio(leftCol, leftId);
+    const ratioRightStart = getColRatio(rightCol, rightId);
+    const totalRatio = ratioLeftStart + ratioRightStart;
+    const minLeft = Math.min(getMinWidth(leftCol), totalW / 2);
+    const minRight = Math.min(getMinWidth(rightCol), totalW / 2);
+
+    startPointerDrag(e, {
+      bodyClass: 'is-resizing-cols',
+      activeElement: resizer,
+      onMove: (ev) => {
+        const dx = ev.clientX - startX;
+        const newLeftW = Math.max(minLeft, Math.min(totalW - minRight, startLeftW + dx));
+        applyPairWidths(newLeftW, totalW - newLeftW, totalRatio);
+      },
+      onEnd: () => chrome.storage.local.set({ [STORE_COL_RATIOS_KEY]: state.colRatios }),
+    });
+  });
+
+  resizer.addEventListener('keydown', (e) => {
+    if (state.collapsed.has(leftId) || state.collapsed.has(rightId)) return;
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    resizeBy((e.key === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 40 : 12));
+    chrome.storage.local.set({ [STORE_COL_RATIOS_KEY]: state.colRatios });
+  });
+
+  resizer.addEventListener('dblclick', () => {
+    if (state.collapsed.has(leftId) || state.collapsed.has(rightId)) return;
+    delete state.colRatios[leftId];
+    delete state.colRatios[rightId];
+    leftCol.style.flex = '';
+    leftCol.style.width = '';
+    rightCol.style.flex = '';
+    rightCol.style.width = '';
+    chrome.storage.local.set({ [STORE_COL_RATIOS_KEY]: state.colRatios });
+    requestAnimationFrame(syncAriaValue);
+  });
+
+  requestAnimationFrame(syncAriaValue);
 }
 
 async function moveModel(siteId, delta) {
@@ -272,7 +549,7 @@ function buildHeader() {
     const judgeCrownBtn = el('button', {
       className: 'judge-crown-btn' + (isJudge ? ' active' : ''),
       id: `crown-${a.id}`,
-      title: isJudge ? '取消设为裁判' : '设为对比裁判（不参与同问，作答完毕后自动接收对比提示词）',
+      title: isJudge ? '取消设为裁判' : '设为对比裁判（可在裁判列顶部设置参与范围）',
       textContent: '👑',
     });
     judgeCrownBtn.onclick = (e) => {
@@ -368,8 +645,47 @@ function updateCount() {
 }
 
 // --------------------------------------------------------------------- 裁判模型管理
+function syncJudgeParticipationControls() {
+  for (const a of A.ADAPTERS) {
+    const isJudge = state.judgeId === a.id;
+    const bar = document.getElementById(`judge-participation-${a.id}`);
+    const askToggle = document.getElementById(`judge-ask-${a.id}`);
+    const compareToggle = document.getElementById(`judge-compare-${a.id}`);
+
+    if (bar) bar.hidden = !isJudge;
+    if (askToggle) askToggle.checked = state.judgeAnswersQuestion;
+    if (compareToggle) {
+      compareToggle.checked = state.judgeAnswersQuestion && state.judgeIncludedInComparison;
+      compareToggle.disabled = !state.judgeAnswersQuestion;
+      compareToggle.setAttribute(
+        'aria-label',
+        state.judgeAnswersQuestion
+          ? '是否参与比对'
+          : '是否参与比对（需先开启是否参与问题）'
+      );
+    }
+  }
+}
+
+function setJudgeParticipation({ answersQuestion, includedInComparison }) {
+  state.judgeAnswersQuestion = Boolean(answersQuestion);
+  state.judgeIncludedInComparison = state.judgeAnswersQuestion && Boolean(includedInComparison);
+  syncJudgeParticipationControls();
+  chrome.storage.local.set({
+    [STORE_JUDGE_ASK_KEY]: state.judgeAnswersQuestion,
+    [STORE_JUDGE_COMPARE_KEY]: state.judgeIncludedInComparison,
+  });
+}
+
 function setJudge(siteId) {
-  state.judgeId = siteId || null;
+  const nextJudgeId = siteId || null;
+  if (state.judgeId !== nextJudgeId) {
+    // 切换裁判后旧监控不得把上一轮提示词派发到新裁判。
+    activeSynthesisToken++;
+    state.judgePrompt = '';
+    state.judgePromptJudgeId = null;
+  }
+  state.judgeId = nextJudgeId;
   chrome.storage.local.set({ [STORE_JUDGE_KEY]: state.judgeId });
 
   // 1. 同步更新下拉框
@@ -386,7 +702,7 @@ function setJudge(siteId) {
     if (item) item.classList.toggle('is-judge', isThis);
     if (crown) {
       crown.classList.toggle('active', isThis);
-      crown.title = isThis ? '取消设为裁判' : '设为对比裁判（不参与同问，作答完毕后自动接收对比提示词）';
+      crown.title = isThis ? '取消设为裁判' : '设为对比裁判（可在裁判列顶部设置参与范围）';
     }
   }
 
@@ -418,6 +734,7 @@ function setJudge(siteId) {
     }
   }
 
+  syncJudgeParticipationControls();
   updateDlgJudgeButton();
 }
 
@@ -447,23 +764,32 @@ function updateDlgJudgeButton() {
   const btn = $('#dlgSendJudge');
   const goBtn = $('#dlgGoJudge');
   if (!btn) return;
-  if (state.judgeId && A.byId(state.judgeId)) {
-    const name = A.byId(state.judgeId).name;
-    btn.innerHTML = `<span>👑 派发给 [${name}] 对比分析</span>`;
+  const targetJudgeId = state.judgePromptJudgeId || state.judgeId;
+  if (targetJudgeId && A.byId(targetJudgeId)) {
+    const name = A.byId(targetJudgeId).name;
+    const promptRun = state.currentRun?.judgeId === targetJudgeId
+      ? state.currentRun
+      : null;
+    const dispatching = Boolean(promptRun?.dispatchInFlight);
+    const dispatched = Boolean(promptRun?.comparisonDispatched);
+    btn.innerHTML = `<span>${dispatching ? '⏳' : '👑'} ${dispatched ? '已派发' : dispatching ? '正在派发给' : '派发给'} [${name}]${dispatched ? '' : ' 对比分析'}</span>`;
     btn.style.display = 'inline-flex';
+    btn.disabled = dispatching || dispatched;
     btn.onclick = () => {
       $('#dlg').close();
-      if (state.judgePrompt) {
-        dispatchToJudge(state.judgeId, state.judgePrompt);
+      if (state.judgePrompt && !dispatching && !dispatched) {
+        if (promptRun) dispatchRunToJudge(promptRun, state.judgePrompt);
+        else dispatchToJudge(targetJudgeId, state.judgePrompt);
       }
     };
     if (goBtn) {
       goBtn.style.display = 'inline-flex';
       goBtn.innerHTML = `<span>🔍 前往 [${name}] 窗口</span>`;
-      goBtn.onclick = () => focusJudgeColumn(state.judgeId);
+      goBtn.onclick = () => focusJudgeColumn(targetJudgeId);
     }
   } else {
     btn.style.display = 'none';
+    btn.disabled = false;
     if (goBtn) goBtn.style.display = 'none';
   }
 }
@@ -482,7 +808,7 @@ function focusJudgeColumn(judgeId) {
   col.classList.add('judge-highlight-pulse');
 }
 
-function renderCompareDialog(question, entries, prompt, judgeId) {
+function renderCompareDialog(question, entries, prompt, judgeId, { duel = false } = {}) {
   // 1. 设置对比问题
   const qEl = $('#dlgQuestion');
   if (qEl) qEl.textContent = question || '(未记录原问题)';
@@ -510,7 +836,11 @@ function renderCompareDialog(question, entries, prompt, judgeId) {
     if (judgeRow) judgeRow.style.display = 'flex';
     if (judgeNameEl) judgeNameEl.textContent = `👑 ${jName}`;
     if (judgeStatusText) {
-      judgeStatusText.textContent = `⚡ 当前由 [${jName}] 担任终极裁判。标准：直观打分 ➔ 亮点与不足 ➔ 详细整理采纳方案！`;
+      if (duel && entries.length === 1) {
+        judgeStatusText.textContent = `⚡ 当前为 1v1 单挑切磋模式：[${jName}] 将针对原问题给出独立解答，并与 [${entries[0].name}] 的回答深度对比与融合采纳！`;
+      } else {
+        judgeStatusText.textContent = `⚡ 当前由 [${jName}] 担任终极裁判。标准：直观打分 ➔ 亮点与不足 ➔ 详细整理采纳方案！`;
+      }
     }
     if (btnFocusJudgeCol) {
       btnFocusJudgeCol.style.display = 'inline-flex';
@@ -609,6 +939,7 @@ function toggleMaximize(id) {
       btn.title = '还原视图';
     }
   }
+  syncColResizers();
 }
 
 function toggleCollapse(id) {
@@ -624,6 +955,7 @@ function toggleCollapse(id) {
     state.collapsed.add(id);
     col.classList.add('collapsed');
   }
+  syncColResizers();
 }
 
 function toggleSidebar(forceState) {
@@ -663,6 +995,9 @@ function setLayoutMode(mode) {
   if (scrollNav) {
     scrollNav.classList.toggle('visible', mode === 'scroll');
   }
+
+  applyColRatios();
+  syncColResizers();
 
   chrome.storage.local.set({ [STORE_LAYOUT_KEY]: mode });
 }
@@ -743,7 +1078,7 @@ function makeCol(a) {
   const judgeBtn = el('button', {
     className: 'col-btn btn-judge' + (isJudge ? ' active' : ''),
     id: `btn-judge-${a.id}`,
-    title: isJudge ? '取消设为裁判' : '设为对比裁判（不参与同问，作答完毕后自动接收对比提示词）',
+    title: isJudge ? '取消设为裁判' : '设为对比裁判（可在裁判列顶部设置参与范围）',
     textContent: '👑',
   });
   judgeBtn.onclick = (e) => { e.stopPropagation(); setJudge(state.judgeId === a.id ? null : a.id); };
@@ -774,6 +1109,58 @@ function makeCol(a) {
     }
   };
 
+  const participationBar = el('div', {
+    className: 'judge-participation-bar',
+    id: `judge-participation-${a.id}`,
+    hidden: !isJudge,
+  });
+  const makeParticipationToggle = (kind, labelText, checked, disabled, title) => {
+    const label = el('label', { className: 'judge-participation-toggle', title });
+    const input = el('input', {
+      type: 'checkbox',
+      id: `judge-${kind}-${a.id}`,
+      checked,
+      disabled,
+    });
+    input.setAttribute('role', 'switch');
+    input.setAttribute('aria-label', labelText);
+    label.append(
+      el('span', { className: 'judge-participation-label', textContent: labelText }),
+      input,
+      el('span', { className: 'judge-switch-track', ariaHidden: 'true' })
+    );
+    return { label, input };
+  };
+
+  const askParticipation = makeParticipationToggle(
+    'ask',
+    '是否参与问题',
+    state.judgeAnswersQuestion,
+    false,
+    '开启后，裁判也会收到第一轮原问题并独立作答'
+  );
+  const compareParticipation = makeParticipationToggle(
+    'compare',
+    '是否参与比对',
+    state.judgeAnswersQuestion && state.judgeIncludedInComparison,
+    !state.judgeAnswersQuestion,
+    '开启后，将裁判的第一轮回答也纳入横向对比；必须先参与问题'
+  );
+
+  askParticipation.input.addEventListener('change', () => {
+    setJudgeParticipation({
+      answersQuestion: askParticipation.input.checked,
+      includedInComparison: askParticipation.input.checked && compareParticipation.input.checked,
+    });
+  });
+  compareParticipation.input.addEventListener('change', () => {
+    setJudgeParticipation({
+      answersQuestion: askParticipation.input.checked,
+      includedInComparison: compareParticipation.input.checked,
+    });
+  });
+  participationBar.append(askParticipation.label, compareParticipation.label);
+
   const frame = el('iframe', { src: a.url, id: `if-${a.id}` });
 
   const fb = el('div', { className: 'fallback' });
@@ -784,7 +1171,7 @@ function makeCol(a) {
              link.target = '_blank'; return link; })()
   );
 
-  col.append(h, frame, fb);
+  col.append(h, participationBar, frame, fb);
 
   // iframe 被网络层拦掉时不会触发 error，只能靠"迟迟没有 frame-ready"判断。
   setTimeout(() => {
@@ -811,28 +1198,76 @@ async function ask() {
   const targets = state.order.filter((id) => state.enabled.has(id));
   if (!targets.length) { $('#status').textContent = '先勾选至少一个模型'; return; }
 
-  // 裁判模型排除在第一阶段同问之外
+  // 每次发送都冻结本轮参与规则；之后切换开关只影响下一轮。
+  activeSynthesisToken++;
+  state.judgePrompt = '';
+  state.judgePromptJudgeId = null;
   const judgeId = state.judgeId && state.enabled.has(state.judgeId) ? state.judgeId : null;
-  const askTargets = judgeId ? targets.filter((id) => id !== judgeId) : targets;
+  const judgeAnswersQuestion = Boolean(judgeId && state.judgeAnswersQuestion);
+  const judgeIncludedInComparison = Boolean(
+    judgeAnswersQuestion && state.judgeIncludedInComparison
+  );
+  const askTargets = targets.filter((id) => id !== judgeId || judgeAnswersQuestion);
 
-  if (judgeId && !askTargets.length) {
-    $('#status').textContent = '已设置裁判模型，但没有其他作答模型，请勾选其他模型';
+  if (judgeId && !judgeAnswersQuestion && !askTargets.length) {
+    $('#status').textContent = '当前只选择了裁判；请开启“是否参与问题”或再勾选一个作答模型';
     return;
   }
+
+  const requiredSites = new Set(askTargets);
+  if (judgeId && state.autoJudge) requiredSites.add(judgeId);
+  const lockedId = [...requiredSites].find((id) => state.lockedSites.has(id));
+  if (lockedId) {
+    const lockedName = A.byId(lockedId)?.name || lockedId;
+    $('#status').textContent = `[${lockedName}] 正在生成上一轮裁决，请完成后再开始新一轮`;
+    return;
+  }
+
+  const run = {
+    question: text,
+    judgeId,
+    judgeAnswersQuestion,
+    judgeIncludedInComparison,
+    askedIds: [...askTargets],
+    preparedIds: [],
+    firedIds: [],
+    waitIds: [],
+    plannedComparisonIds: askTargets.filter(
+      (id) => id !== judgeId || judgeIncludedInComparison
+    ),
+    comparisonIds: [],
+    answerBaselines: {},
+    answerBaselineCounts: {},
+    answers: {},
+    comparisonDispatched: false,
+    dispatchInFlight: false,
+    dispatchPromise: null,
+  };
+  state.currentRun = run;
 
   state.busy = true;
   $('#go').disabled = true;
   lastQuestion = text;
 
   const judgeName = judgeId && A.byId(judgeId) ? A.byId(judgeId).name : '';
-  const judgeSuffix = judgeId ? `（👑 ${judgeName} 候审中）` : '';
+  const judgeSuffix = judgeId
+    ? judgeAnswersQuestion
+      ? `（👑 ${judgeName} 同步作答）`
+      : `（👑 ${judgeName} 候审中）`
+    : '';
   $('#status').textContent = files.length
     ? `发送到 ${askTargets.length} 个模型${judgeSuffix}（含 ${files.length} 个附件，上传可能较慢）…`
     : `发送到 ${askTargets.length} 个模型${judgeSuffix}…`;
 
   askTargets.forEach((id) => setMeta(id, files.length ? '上传中' : '发送中'));
   if (judgeId) {
-    setMeta(judgeId, `👑 裁判就位 (等待 ${askTargets.length} 家模型作答…)`);
+    if (judgeAnswersQuestion) {
+      setMeta(judgeId, '👑 裁判参与回答中…');
+    } else if (askTargets.length === 1) {
+      setMeta(judgeId, `👑 裁判就位 (单挑模式: 待会我来解答并裁决)`);
+    } else {
+      setMeta(judgeId, `👑 裁判就位 (等待 ${askTargets.length} 家模型作答…)`);
+    }
   }
 
   const autoSend = $('#autosend').checked;
@@ -878,6 +1313,18 @@ async function ask() {
   );
 
   const ready = prepared.filter((p) => p.ok).map((p) => p.id);
+  for (const p of prepared) {
+    if (!p.ok) continue;
+    run.answerBaselines[p.id] = p.answerBaselineSignature ?? null;
+    run.answerBaselineCounts[p.id] = Number.isFinite(p.answerBaselineCount)
+      ? p.answerBaselineCount
+      : null;
+  }
+  run.preparedIds = [...ready];
+  run.waitIds = [...ready];
+  run.comparisonIds = ready.filter(
+    (id) => id !== judgeId || judgeIncludedInComparison
+  );
   if (!autoSend) {
     $('#status').textContent = `${ready.length}/${askTargets.length} 已填入（未自动发送，请在各栏手动发）`;
     state.busy = false;
@@ -885,12 +1332,31 @@ async function ask() {
     return;
   }
 
+  // prepare 可能持续数秒；在真正 fire 前重取一次基线，避免把期间仍在增长的旧回答
+  // 当成本轮的新回答。
+  const baselineResults = await Promise.all(
+    ready.map((id) => send(id, { type: 'peek' }, 3000).then((r) => ({ id, ...r })))
+  );
+  for (const baseline of baselineResults) {
+    if (!baseline.ok) continue;
+    run.answerBaselines[baseline.id] = baseline.signature || `length:${baseline.length || 0}`;
+    run.answerBaselineCounts[baseline.id] = Number.isFinite(baseline.answerCount)
+      ? baseline.answerCount
+      : null;
+  }
+
   const fired = await Promise.all(
     ready.map((id) => send(id, { type: 'fire' }, 15000).then((r) => ({ id, ...r })))
   );
 
   for (const f of fired) setMeta(f.id, f.ok ? '已发送' : `发送失败: ${f.error}`);
-  const good = fired.filter((f) => f.ok).length;
+  const sentIds = fired.filter((f) => f.ok).map((f) => f.id);
+  run.firedIds = [...sentIds];
+  run.waitIds = [...sentIds];
+  run.comparisonIds = sentIds.filter(
+    (id) => id !== judgeId || judgeIncludedInComparison
+  );
+  const good = sentIds.length;
   const failed = prepared.filter((p) => !p.ok).length;
   $('#status').textContent =
     `${good}/${askTargets.length} 已发送` + (failed ? `，${failed} 个填入失败` : '') + judgeSuffix;
@@ -903,8 +1369,11 @@ async function ask() {
     q.focus();
 
     // 如果开启了裁判与自动派发，启动后台监控并在作答完毕后自动派发给裁判
-    if (judgeId && state.autoJudge) {
-      monitorAndSynthesize(ready, judgeId, text);
+    const hasNonJudgeAnswer = run.comparisonIds.some((id) => id !== judgeId);
+    if (judgeId && state.judgeId === judgeId && state.autoJudge && hasNonJudgeAnswer) {
+      monitorAndSynthesize(run);
+    } else if (judgeId && !hasNonJudgeAnswer && judgeAnswersQuestion) {
+      setMeta(judgeId, '👑 已参与回答（无其他回答可比对）');
     }
   }
 
@@ -913,8 +1382,8 @@ async function ask() {
 }
 
 // --------------------------------------------------------------------- 裁判派发与监控
-async function dispatchToJudge(judgeId, prompt) {
-  if (!judgeId || !prompt) return;
+async function dispatchToJudge(judgeId, prompt, run = null) {
+  if (!judgeId || !prompt) return { ok: false, error: '缺少裁判或对比提示词' };
   const judgeCol = document.getElementById(`col-${judgeId}`);
   if (judgeCol && state.collapsed.has(judgeId)) {
     toggleCollapse(judgeId);
@@ -925,8 +1394,23 @@ async function dispatchToJudge(judgeId, prompt) {
   if (!state.frames.has(judgeId)) {
     setMeta(judgeId, '👑 裁判 frame 未就绪');
     $('#status').textContent = `裁判 [${judgeName}] 尚未就绪，无法派发`;
-    return;
+    return { ok: false, error: '裁判 frame 未就绪' };
   }
+
+  if (state.lockedSites.has(judgeId)) {
+    setMeta(judgeId, '👑 裁判正在处理上一轮任务');
+    return { ok: false, error: '裁判正在处理上一轮任务' };
+  }
+  state.lockedSites.add(judgeId);
+  const releaseJudgeLock = () => state.lockedSites.delete(judgeId);
+
+  // 裁判若参加了首轮，第二轮刚提交时 latestAnswer 仍可能是首轮旧回答。
+  // 记录基线长度，只有检测到新回答后才开始计算“稳定完成”。
+  const baseline = await send(judgeId, { type: 'peek' }, 4000);
+  const baselineLength = baseline.ok ? (baseline.length || 0) : 0;
+  const baselineSignature = baseline.ok
+    ? (baseline.signature || `length:${baselineLength}`)
+    : '';
 
   setMeta(judgeId, '👑 注入对比提示词…');
   $('#status').textContent = `正在将对比分析任务派发给裁判 [${judgeName}]…`;
@@ -942,17 +1426,19 @@ async function dispatchToJudge(judgeId, prompt) {
   }, 30000);
 
   if (!prep.ok) {
+    releaseJudgeLock();
     setMeta(judgeId, `👑 派发失败: ${prep.error}`);
     $('#status').textContent = `派发给裁判 [${judgeName}] 失败: ${prep.error}`;
-    return;
+    return { ok: false, error: prep.error };
   }
 
   setMeta(judgeId, '👑 触发裁判作答…');
   const fired = await send(judgeId, { type: 'fire' }, 15000);
   if (!fired.ok) {
+    releaseJudgeLock();
     setMeta(judgeId, `👑 提交失败: ${fired.error}`);
     $('#status').textContent = `裁判 [${judgeName}] 提交失败: ${fired.error}`;
-    return;
+    return { ok: false, error: fired.error };
   }
 
   setMeta(judgeId, '👑 裁判生成对比中…');
@@ -962,158 +1448,340 @@ async function dispatchToJudge(judgeId, prompt) {
   // 轮询裁判生成进度
   let lastLen = 0;
   let stableCount = 0;
+  let responseStarted = false;
   const pollStart = Date.now();
   const maxPoll = 180000;
+  let judgePollInFlight = false;
+  let judgeFinished = false;
+  const ownsCurrentUi = () => !run ||
+    (state.currentRun === run && state.judgeId === judgeId);
 
   const judgeTicker = setInterval(async () => {
-    if (Date.now() - pollStart > maxPoll) {
-      clearInterval(judgeTicker);
-      setMeta(judgeId, '👑 裁判对比完成 (已达最大等待)');
-      judgeCol?.classList.remove('judge-analyzing');
-      judgeCol?.classList.add('judge-finished');
-      return;
-    }
-    const r = await send(judgeId, { type: 'peek' }, 4000);
-    if (r.ok) {
-      const curLen = r.length || 0;
-      setMeta(judgeId, `👑 裁判分析中 (${curLen} 字)`);
-      if (curLen > 60 && curLen === lastLen) {
-        stableCount++;
-        if (stableCount >= 2) {
-          clearInterval(judgeTicker);
-          setMeta(judgeId, `👑 对比完成 (${curLen} 字) ✓`);
-          judgeCol?.classList.remove('judge-analyzing');
+    if (judgePollInFlight || judgeFinished) return;
+    judgePollInFlight = true;
+    try {
+      if (Date.now() - pollStart > maxPoll) {
+        judgeFinished = true;
+        clearInterval(judgeTicker);
+        releaseJudgeLock();
+        judgeCol?.classList.remove('judge-analyzing');
+        if (ownsCurrentUi()) {
+          setMeta(judgeId, '👑 裁判对比完成 (已达最大等待)');
           judgeCol?.classList.add('judge-finished');
-          $('#status').innerHTML = `👑 裁判 [<b>${judgeName}</b>] 最终裁决已出炉！<a href="#" id="linkFocusJudge" style="color:#d97706;font-weight:700;margin-left:8px;text-decoration:underline;cursor:pointer">点击直达查看</a>`;
-          document.getElementById('linkFocusJudge')?.addEventListener('click', (e) => {
-            e.preventDefault();
-            focusJudgeColumn(judgeId);
-          });
         }
-      } else {
-        lastLen = curLen;
-        stableCount = 0;
+        return;
       }
+      const r = await send(judgeId, { type: 'peek' }, 4000);
+      if (r.ok) {
+        const curLen = r.length || 0;
+        const curSignature = r.signature || `length:${curLen}`;
+        if (!responseStarted) {
+          if (curSignature === baselineSignature) {
+            if (ownsCurrentUi()) setMeta(judgeId, '👑 已提交，等待裁判开始新回答…');
+            return;
+          }
+          responseStarted = true;
+          lastLen = curLen;
+          stableCount = 0;
+          if (ownsCurrentUi()) setMeta(judgeId, `👑 裁判分析中 (${curLen} 字)`);
+          return;
+        }
+        if (ownsCurrentUi()) setMeta(judgeId, `👑 裁判分析中 (${curLen} 字)`);
+        if (curLen > 60 && curLen === lastLen) {
+          stableCount++;
+          if (stableCount >= 2) {
+            judgeFinished = true;
+            clearInterval(judgeTicker);
+            releaseJudgeLock();
+            judgeCol?.classList.remove('judge-analyzing');
+            if (ownsCurrentUi()) {
+              setMeta(judgeId, `👑 对比完成 (${curLen} 字) ✓`);
+              judgeCol?.classList.add('judge-finished');
+              $('#status').innerHTML = `👑 裁判 [<b>${judgeName}</b>] 最终裁决已出炉！<a href="#" id="linkFocusJudge" style="color:#d97706;font-weight:700;margin-left:8px;text-decoration:underline;cursor:pointer">点击直达查看</a>`;
+              document.getElementById('linkFocusJudge')?.addEventListener('click', (e) => {
+                e.preventDefault();
+                focusJudgeColumn(judgeId);
+              });
+            }
+          }
+        } else {
+          lastLen = curLen;
+          stableCount = 0;
+        }
+      }
+    } finally {
+      judgePollInFlight = false;
     }
   }, 2500);
+
+  return { ok: true };
 }
 
-async function monitorAndSynthesize(participants, judgeId, question) {
-  const token = ++activeSynthesisToken;
-  const judgeAdapter = A.byId(judgeId);
-  const judgeName = judgeAdapter ? judgeAdapter.name : judgeId;
+function dispatchRunToJudge(run, prompt) {
+  if (!run) return dispatchToJudge(state.judgePromptJudgeId || state.judgeId, prompt);
+  if (run.comparisonDispatched) {
+    return Promise.resolve({ ok: true, alreadyDispatched: true });
+  }
+  if (run.dispatchPromise) return run.dispatchPromise;
 
-  setMeta(judgeId, `👑 裁判就位 (等待 ${participants.length} 家模型作答…)`);
+  run.dispatchInFlight = true;
+  updateDlgJudgeButton();
+  const attempt = dispatchToJudge(run.judgeId, prompt, run)
+    .then((result) => {
+      run.dispatchInFlight = false;
+      if (result?.ok) {
+        run.comparisonDispatched = true;
+      } else {
+        run.dispatchPromise = null;
+      }
+      updateDlgJudgeButton();
+      return result;
+    })
+    .catch((error) => {
+      state.lockedSites.delete(run.judgeId);
+      run.dispatchInFlight = false;
+      run.dispatchPromise = null;
+      $('#status').textContent = `裁判派发异常: ${error?.message || error}`;
+      updateDlgJudgeButton();
+      return { ok: false, error: error?.message || String(error) };
+    });
+  run.dispatchPromise = attempt;
+  return attempt;
+}
+
+function isDuelRun(run) {
+  if (!run?.judgeId || run.judgeAnswersQuestion) return false;
+  const plannedIds = run.plannedComparisonIds || run.comparisonIds;
+  return plannedIds.filter((id) => id !== run.judgeId).length === 1;
+}
+
+function cacheRunAnswers(run, results) {
+  if (!run.answers) run.answers = {};
+  for (const result of results) {
+    if (!result.ok || !result.text) continue;
+    const adapter = A.byId(result.id);
+    run.answers[result.id] = {
+      id: result.id,
+      name: result.name || adapter?.name || result.id,
+      text: result.text,
+      isJudge: result.id === run.judgeId,
+    };
+  }
+}
+
+function comparisonEntries(run) {
+  return run.comparisonIds
+    .map((id) => run.answers?.[id])
+    .filter(Boolean);
+}
+
+async function monitorAndSynthesize(run) {
+  const { waitIds, judgeId, question } = run;
+  if (state.currentRun !== run || state.judgeId !== judgeId || !state.autoJudge) return;
+  const token = ++activeSynthesisToken;
+
+  if (isDuelRun(run)) {
+    setMeta(judgeId, `👑 裁判就位 (单挑模式: 等待作答后亲自解答并裁决…)`);
+  } else if (run.judgeAnswersQuestion) {
+    setMeta(judgeId, `👑 首轮回答中 (等待 ${waitIds.length} 家完成…)`);
+  } else {
+    setMeta(judgeId, `👑 裁判就位 (等待 ${waitIds.length} 家模型作答…)`);
+  }
 
   const pollInterval = 2500;
   const maxWaitMs = 150000;
   const startTime = Date.now();
-  const lastLens = new Map();
+  const lastSignatures = new Map();
   const stableRounds = new Map();
+  const answerStarted = new Map();
+  let pollInFlight = false;
 
   // 延迟 4 秒后再开始检查，给各模型初次响应留出时间
   await new Promise((resolve) => setTimeout(resolve, 4000));
-  if (token !== activeSynthesisToken) return;
+  if (token !== activeSynthesisToken || state.currentRun !== run) return;
 
   const timer = setInterval(async () => {
-    if (token !== activeSynthesisToken) {
-      clearInterval(timer);
-      return;
-    }
-
-    if (Date.now() - startTime > maxWaitMs) {
-      clearInterval(timer);
-      if (token === activeSynthesisToken) {
-        triggerAutoSynthesis(participants, judgeId, question, token);
+    if (pollInFlight) return;
+    pollInFlight = true;
+    try {
+      if (token !== activeSynthesisToken || state.currentRun !== run) {
+        clearInterval(timer);
+        return;
       }
-      return;
-    }
 
-    let allStable = true;
-    let anyAnswered = false;
-    let answeredCount = 0;
-
-    for (const id of participants) {
-      const r = await send(id, { type: 'peek' }, 3000);
-      if (r.ok) {
-        const len = r.length || 0;
-        if (len > 0) {
-          anyAnswered = true;
-          answeredCount++;
+      if (Date.now() - startTime > maxWaitMs) {
+        clearInterval(timer);
+        if (token === activeSynthesisToken) {
+          triggerAutoSynthesis(run, token);
         }
-        const prev = lastLens.get(id) ?? -1;
-        if (len > 0 && len === prev) {
-          const rounds = (stableRounds.get(id) || 0) + 1;
-          stableRounds.set(id, rounds);
-          if (rounds < 2) allStable = false;
+        return;
+      }
+
+      let allStable = true;
+      let anyAnswered = false;
+      let answeredCount = 0;
+
+      for (const id of waitIds) {
+        const r = await send(id, { type: 'peek' }, 3000);
+        if (r.ok) {
+          const len = r.length || 0;
+          const signature = r.signature || `length:${len}`;
+          const baseline = run.answerBaselines?.[id];
+          const baselineCount = run.answerBaselineCounts?.[id];
+          const hasNewNode = Number.isFinite(baselineCount) &&
+            Number.isFinite(r.answerCount) && r.answerCount > baselineCount;
+          let started = answerStarted.get(id);
+          if (started === undefined) {
+            started = baseline == null || hasNewNode || signature !== baseline;
+            answerStarted.set(id, started);
+          } else if (!started && (hasNewNode || signature !== baseline)) {
+            started = true;
+            answerStarted.set(id, true);
+          }
+
+          if (!started) {
+            allStable = false;
+            continue;
+          }
+          if (len > 0) {
+            anyAnswered = true;
+            answeredCount++;
+          }
+          const prev = lastSignatures.get(id);
+          if (len > 0 && signature === prev) {
+            const rounds = (stableRounds.get(id) || 0) + 1;
+            stableRounds.set(id, rounds);
+            if (rounds < 2) allStable = false;
+          } else {
+            lastSignatures.set(id, signature);
+            stableRounds.set(id, 0);
+            allStable = false;
+          }
         } else {
-          lastLens.set(id, len);
-          stableRounds.set(id, 0);
-          allStable = false;
+          // frame 无响应或异常，不卡死流程
+          stableRounds.set(id, 99);
         }
-      } else {
-        // frame 无响应或异常，不卡死流程
-        stableRounds.set(id, 99);
       }
-    }
 
-    if (answeredCount > 0) {
-      setMeta(judgeId, `👑 裁判就位 (已作答: ${answeredCount}/${participants.length} 家)`);
-    }
-
-    // 至少有一家有文字输出，且所有有回答的模型均已稳定 2 轮（至少 5 秒不再增长）
-    if (anyAnswered && allStable) {
-      clearInterval(timer);
-      if (token === activeSynthesisToken) {
-        triggerAutoSynthesis(participants, judgeId, question, token);
+      if (answeredCount > 0) {
+        const prefix = run.judgeAnswersQuestion ? '👑 首轮回答中' : '👑 裁判就位';
+        setMeta(judgeId, `${prefix} (已作答: ${answeredCount}/${waitIds.length} 家)`);
       }
+
+      // 至少有一家有文字输出，且所有有回答的模型均已稳定 2 轮（至少 5 秒不再增长）
+      if (anyAnswered && allStable) {
+        clearInterval(timer);
+        if (token === activeSynthesisToken) {
+          triggerAutoSynthesis(run, token);
+        }
+      }
+    } finally {
+      pollInFlight = false;
     }
   }, pollInterval);
 }
 
-async function triggerAutoSynthesis(participants, judgeId, question, token) {
-  if (token && token !== activeSynthesisToken) return;
+async function triggerAutoSynthesis(run, token) {
+  if ((token && token !== activeSynthesisToken) || state.currentRun !== run ||
+      state.judgeId !== run.judgeId || !state.autoJudge) return;
+  const { waitIds, judgeId, question } = run;
   const judgeAdapter = A.byId(judgeId);
   const judgeName = judgeAdapter ? judgeAdapter.name : judgeId;
 
   setMeta(judgeId, '👑 提取各模型作答…');
   const results = await Promise.all(
-    participants.map((id) =>
-      send(id, { type: 'collect', maxWait: 8000 }, 12000).then((r) => ({ id, ...r }))
+    waitIds.map((id) =>
+      send(id, {
+        type: 'collect',
+        maxWait: 8000,
+        ...(typeof run.answerBaselines?.[id] === 'string'
+          ? {
+              baselineSignature: run.answerBaselines[id],
+              baselineAnswerCount: run.answerBaselineCounts?.[id],
+            }
+          : {}),
+      }, 12000).then((r) => ({ id, ...r }))
     )
   );
 
-  if (token && token !== activeSynthesisToken) return;
+  if ((token && token !== activeSynthesisToken) || state.currentRun !== run ||
+      state.judgeId !== run.judgeId || !state.autoJudge) return;
 
-  const entries = results
-    .filter((r) => r.ok && r.text)
-    .map((r) => ({ name: r.name, text: r.text }));
+  cacheRunAnswers(run, results);
+  const entries = comparisonEntries(run);
 
-  if (!entries.length) {
+  if (run.judgeIncludedInComparison && !run.answers?.[judgeId]) {
+    setMeta(judgeId, '👑 未抓到裁判首轮回答，已停止自动评测');
+    $('#status').textContent = '裁判已设置参与比对，但未抓到它的首轮回答；本轮未自动派发裁决';
+    return;
+  }
+
+  if (!entries.some((entry) => entry.id !== judgeId)) {
     setMeta(judgeId, '👑 未抓到有效回答');
     return;
   }
 
-  const prompt = A.buildComparePrompt(question, entries);
+  const duel = isDuelRun(run);
+  const prompt = A.buildComparePrompt(question, entries, { mode: duel ? 'duel' : 'review' });
   state.judgePrompt = prompt;
+  state.judgePromptJudgeId = judgeId;
   updateDlgJudgeButton();
 
   // 更新对话框内容预备
-  renderCompareDialog(question, entries, prompt, judgeId);
+  renderCompareDialog(question, entries, prompt, judgeId, { duel });
 
-  await dispatchToJudge(judgeId, prompt);
+  await dispatchRunToJudge(run, prompt);
 }
 
 // --------------------------------------------------------------------- 收集对比
 async function collect() {
   if (state.busy) return;
-  const judgeId = state.judgeId && state.enabled.has(state.judgeId) ? state.judgeId : null;
-  // 收集时排除裁判模型自身
-  const targets = state.order.filter(
-    (id) => state.enabled.has(id) && state.frames.has(id) && id !== judgeId
-  );
-  if (!targets.length) {
-    $('#status').textContent = judgeId ? '除裁判外没有就绪的模型' : '没有就绪的模型';
+
+  let run = state.currentRun;
+  if (!run) {
+    const judgeId = state.judgeId && state.enabled.has(state.judgeId) ? state.judgeId : null;
+    const judgeAnswersQuestion = Boolean(judgeId && state.judgeAnswersQuestion);
+    const judgeIncludedInComparison = Boolean(
+      judgeAnswersQuestion && state.judgeIncludedInComparison
+    );
+    const waitIds = state.order.filter(
+      (id) => state.enabled.has(id) && state.frames.has(id) &&
+        (id !== judgeId || judgeAnswersQuestion)
+    );
+    run = {
+      question: lastQuestion,
+      judgeId,
+      judgeAnswersQuestion,
+      judgeIncludedInComparison,
+      askedIds: [...waitIds],
+      preparedIds: [],
+      firedIds: [],
+      waitIds,
+      plannedComparisonIds: waitIds.filter(
+        (id) => id !== judgeId || judgeIncludedInComparison
+      ),
+      comparisonIds: waitIds.filter(
+        (id) => id !== judgeId || judgeIncludedInComparison
+      ),
+      answerBaselines: {},
+      answerBaselineCounts: {},
+      answers: {},
+      comparisonDispatched: false,
+      dispatchInFlight: false,
+      dispatchPromise: null,
+    };
+    state.currentRun = run;
+  }
+
+  if (!run.waitIds.length) {
+    $('#status').textContent = '本轮没有成功填入或发送的模型，无法收集回答';
+    return;
+  }
+
+  const { judgeId } = run;
+  const waitIds = run.waitIds.filter((id) => state.frames.has(id));
+  if (!waitIds.length) {
+    $('#status').textContent = '没有本轮已就绪的模型可收集';
     return;
   }
 
@@ -1124,40 +1792,65 @@ async function collect() {
   $('#collect').disabled = true;
   $('#status').textContent = '等待各模型生成完毕…';
 
+  // 已派发裁决后绝不重新抓裁判，避免把最终报告误当成首轮回答。
+  const pendingIds = waitIds.filter(
+    (id) => !run.answers?.[id] && !(run.comparisonDispatched && id === judgeId)
+  );
+
   // 轮询各栏字数，让用户看到进度而不是干等。
-  const ticker = setInterval(async () => {
-    for (const id of targets) {
+  const ticker = pendingIds.length ? setInterval(async () => {
+    for (const id of pendingIds) {
       const r = await send(id, { type: 'peek' }, 4000);
       if (r.ok) setMeta(id, `${r.length} 字`);
     }
-  }, 1500);
+  }, 1500) : null;
 
   const results = await Promise.all(
-    targets.map((id) =>
-      send(id, { type: 'collect', maxWait: A.MAX_WAIT_MS }, A.MAX_WAIT_MS + 10000)
+    pendingIds.map((id) =>
+      send(id, {
+        type: 'collect',
+        maxWait: A.MAX_WAIT_MS,
+        ...(typeof run.answerBaselines?.[id] === 'string'
+          ? {
+              baselineSignature: run.answerBaselines[id],
+              baselineAnswerCount: run.answerBaselineCounts?.[id],
+            }
+          : {}),
+      }, A.MAX_WAIT_MS + 10000)
         .then((r) => ({ id, ...r })))
   );
-  clearInterval(ticker);
+  if (ticker) clearInterval(ticker);
 
-  const entries = results
-    .filter((r) => r.ok && r.text)
-    .map((r) => ({ name: r.name, text: r.text }));
+  cacheRunAnswers(run, results);
+  const entries = comparisonEntries(run);
   for (const r of results) setMeta(r.id, r.ok && r.text ? `${r.text.length} 字 ✓` : '未抓到');
 
-  if (!entries.length) {
+  if (run.judgeIncludedInComparison && !run.answers?.[judgeId]) {
+    $('#status').textContent = '裁判已设置参与比对，但未抓到它的首轮回答；请确认回答完成后重试';
+  } else if (!entries.length) {
     $('#status').textContent = '没抓到任何回答';
   } else {
-    const prompt = A.buildComparePrompt(lastQuestion, entries);
+    const duel = isDuelRun(run);
+    const prompt = A.buildComparePrompt(
+      run.question || lastQuestion,
+      entries,
+      { mode: duel ? 'duel' : 'review' }
+    );
     state.judgePrompt = prompt;
-    renderCompareDialog(lastQuestion, entries, prompt, judgeId);
+    state.judgePromptJudgeId = judgeId;
+    renderCompareDialog(run.question || lastQuestion, entries, prompt, judgeId, { duel });
     $('#dlg').showModal();
-    $('#status').textContent = entries.length === 1
-      ? '只抓到 1 份回答，其他模型可能未作答或选择器失效'
+    $('#status').textContent = duel
+      ? `已收集 ${entries[0].name} 的回答，已生成 1v1 切磋提示词`
+      : entries.length === 1
+        ? '只抓到 1 份回答，已按单份评审模式生成提示词'
       : `已收集 ${entries.length} 份回答`;
 
     // 如果开启了自动评测，且裁判就绪，立即派发给裁判
-    if (judgeId && state.autoJudge && state.frames.has(judgeId)) {
-      dispatchToJudge(judgeId, prompt);
+    if (judgeId && state.autoJudge && state.judgeId === judgeId &&
+        state.frames.has(judgeId) && !run.comparisonDispatched && !run.dispatchInFlight &&
+        entries.some((entry) => entry.id !== judgeId)) {
+      dispatchRunToJudge(run, prompt);
     }
   }
 
@@ -1256,6 +1949,137 @@ dlgTabs.forEach((tab) => {
   });
 });
 
+// --------------------------------------------------------------------- 底部输入框高度调整
+function getFooterMaxHeight() {
+  const q = $('#q');
+  const footer = $('#inputArea');
+  const layoutBar = $('.layout-bar');
+  if (!q) return 500;
+  const fixedFooterHeight = footer
+    ? footer.getBoundingClientRect().height - q.getBoundingClientRect().height
+    : 0;
+  const available = window.innerHeight - (layoutBar?.getBoundingClientRect().height || 0)
+    - fixedFooterHeight - 160;
+  return Math.max(38, Math.min(500, Math.round(window.innerHeight * 0.6), Math.round(available)));
+}
+
+function syncFooterResizerAria() {
+  const q = $('#q');
+  const resizer = $('#footerResizer');
+  if (!q || !resizer) return;
+  resizer.setAttribute('aria-valuemin', '38');
+  resizer.setAttribute('aria-valuemax', String(getFooterMaxHeight()));
+  resizer.setAttribute('aria-valuenow', String(Math.round(q.getBoundingClientRect().height)));
+}
+
+function applyInputHeight(h, save = true) {
+  const q = $('#q');
+  const btn = $('#expandInputBtn');
+  if (!q) return;
+
+  if (h && h >= 38) {
+    const nextHeight = Math.max(38, Math.min(getFooterMaxHeight(), Math.round(h)));
+    q.style.height = `${nextHeight}px`;
+    state.inputHeight = nextHeight;
+    if (btn) {
+      const isExpanded = nextHeight >= 130;
+      const iconExpand = btn.querySelector('.icon-expand');
+      const iconCollapse = btn.querySelector('.icon-collapse');
+      const span = btn.querySelector('span');
+      if (iconExpand) iconExpand.style.display = isExpanded ? 'none' : '';
+      if (iconCollapse) iconCollapse.style.display = isExpanded ? '' : 'none';
+      if (span) span.textContent = isExpanded ? '收起' : '展开';
+    }
+    if (save) chrome.storage.local.set({ [STORE_INPUT_HEIGHT_KEY]: nextHeight });
+  } else {
+    q.style.height = '';
+    state.inputHeight = null;
+    if (btn) {
+      const iconExpand = btn.querySelector('.icon-expand');
+      const iconCollapse = btn.querySelector('.icon-collapse');
+      const span = btn.querySelector('span');
+      if (iconExpand) iconExpand.style.display = '';
+      if (iconCollapse) iconCollapse.style.display = 'none';
+      if (span) span.textContent = '展开';
+    }
+    if (save) chrome.storage.local.remove(STORE_INPUT_HEIGHT_KEY);
+  }
+  syncFooterResizerAria();
+}
+
+function initFooterResize() {
+  const resizer = $('#footerResizer');
+  const q = $('#q');
+  const expandBtn = $('#expandInputBtn');
+  if (!resizer || !q) return;
+
+  resizer.addEventListener('pointerdown', (e) => {
+    const startY = e.clientY;
+    const startHeight = q.getBoundingClientRect().height;
+
+    startPointerDrag(e, {
+      bodyClass: 'is-resizing-footer',
+      activeElement: resizer,
+      onMove: (ev) => {
+        const deltaY = startY - ev.clientY; // 向上拖拽为增大高度
+        const newH = Math.max(38, Math.min(getFooterMaxHeight(), Math.round(startHeight + deltaY)));
+        applyInputHeight(newH, false);
+      },
+      onEnd: () => applyInputHeight(Math.round(q.getBoundingClientRect().height), true),
+    });
+  });
+
+  // 双击顶部手柄快速恢复默认高度
+  resizer.addEventListener('dblclick', () => {
+    applyInputHeight(null, true);
+  });
+
+  resizer.addEventListener('keydown', (e) => {
+    if (!['ArrowUp', 'ArrowDown', 'Home'].includes(e.key)) return;
+    e.preventDefault();
+    if (e.key === 'Home') {
+      applyInputHeight(null, true);
+      return;
+    }
+    const delta = (e.key === 'ArrowUp' ? 1 : -1) * (e.shiftKey ? 40 : 16);
+    const newH = Math.max(38, Math.min(getFooterMaxHeight(), Math.round(q.getBoundingClientRect().height + delta)));
+    applyInputHeight(newH, true);
+  });
+
+  window.addEventListener('resize', syncFooterResizerAria);
+  syncFooterResizerAria();
+
+  // 展开/收起快捷按钮
+  if (expandBtn) {
+    expandBtn.addEventListener('click', () => {
+      const currentH = q.getBoundingClientRect().height;
+      if (currentH < 130) {
+        applyInputHeight(220, true);
+      } else {
+        applyInputHeight(null, true);
+      }
+    });
+  }
+
+  // 监听 textarea 原生缩放并自动记录持久化
+  if (window.ResizeObserver) {
+    let roTimer = null;
+    const ro = new ResizeObserver((entries) => {
+      if (document.body.classList.contains('is-resizing-footer')) return;
+      for (const entry of entries) {
+        const h = Math.round(entry.contentRect.height);
+        if (h > 0) {
+          clearTimeout(roTimer);
+          roTimer = setTimeout(() => {
+            applyInputHeight(h, true);
+          }, 300);
+        }
+      }
+    });
+    ro.observe(q);
+  }
+}
+
 (async () => {
   const saved = await chrome.storage.local.get([
     STORE_KEY,
@@ -1263,12 +2087,21 @@ dlgTabs.forEach((tab) => {
     STORE_LAYOUT_KEY,
     STORE_JUDGE_KEY,
     STORE_AUTO_JUDGE_KEY,
+    STORE_JUDGE_ASK_KEY,
+    STORE_JUDGE_COMPARE_KEY,
     STORE_SIDEBAR_COLLAPSED_KEY,
+    STORE_INPUT_HEIGHT_KEY,
+    STORE_COL_RATIOS_KEY,
   ]);
   const ids = saved[STORE_KEY];
   state.enabled = new Set(
     Array.isArray(ids) && ids.length ? ids : ['chatgpt', 'deepseek']
   );
+
+  const savedRatios = saved[STORE_COL_RATIOS_KEY];
+  if (savedRatios && typeof savedRatios === 'object') {
+    state.colRatios = { ...savedRatios };
+  }
 
   const savedOrder = saved[STORE_ORDER_KEY];
   const allIds = A.ADAPTERS.map((a) => a.id);
@@ -1293,6 +2126,10 @@ dlgTabs.forEach((tab) => {
   } else {
     state.autoJudge = true;
   }
+  state.judgeAnswersQuestion = Boolean(saved[STORE_JUDGE_ASK_KEY]);
+  state.judgeIncludedInComparison = Boolean(
+    state.judgeAnswersQuestion && saved[STORE_JUDGE_COMPARE_KEY]
+  );
 
   // 绑定底部裁判选择器与自动派发勾选框
   const judgeSel = $('#judgeSelect');
@@ -1307,6 +2144,7 @@ dlgTabs.forEach((tab) => {
     autoJudgeChk.checked = state.autoJudge;
     autoJudgeChk.addEventListener('change', (e) => {
       state.autoJudge = e.target.checked;
+      if (!state.autoJudge) activeSynthesisToken++;
       chrome.storage.local.set({ [STORE_AUTO_JUDGE_KEY]: state.autoJudge });
     });
   }
@@ -1364,6 +2202,12 @@ dlgTabs.forEach((tab) => {
   const savedLayout = saved[STORE_LAYOUT_KEY] || 'grid';
   setLayoutMode(savedLayout);
   updateCount();
+
+  const savedHeight = saved[STORE_INPUT_HEIGHT_KEY];
+  if (savedHeight && savedHeight >= 38) {
+    applyInputHeight(savedHeight, false);
+  }
+  initFooterResize();
 
   await chrome.runtime.sendMessage({ type: 'ensure-framing' }).catch(() => {});
 })();

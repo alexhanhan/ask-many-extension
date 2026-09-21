@@ -11,6 +11,54 @@
   const site = A.bySite(location.hostname);
   if (!site) return;
 
+  const answerSignature = (text) => {
+    if (!text) return '';
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `${text.length}:${(hash >>> 0).toString(36)}`;
+  };
+
+  async function waitForFreshStableAnswer(
+    baselineSignature,
+    baselineAnswerCount,
+    maxWait = A.MAX_WAIT_MS
+  ) {
+    const deadline = Date.now() + maxWait;
+    let started = false;
+    let previousSignature = '';
+    let previousText = '';
+    let stableRounds = 0;
+
+    while (Date.now() < deadline) {
+      const text = A.latestAnswer(site, document) || '';
+      const signature = answerSignature(text);
+      const count = A.answerCount(site, document);
+      if (!started) {
+        const hasNewNode = Number.isFinite(baselineAnswerCount) && count > baselineAnswerCount;
+        if (!hasNewNode && signature === baselineSignature) {
+          await A.sleep(A.POLL_MS);
+          continue;
+        }
+        started = true;
+      }
+
+      if (text && signature === previousSignature) {
+        stableRounds++;
+        if (stableRounds >= A.STABLE_ROUNDS) return text;
+      } else {
+        stableRounds = 0;
+        previousSignature = signature;
+        previousText = text;
+      }
+      await A.sleep(A.POLL_MS);
+    }
+
+    return started ? previousText : null;
+  }
+
   // 只接受面板直接创建的 AI iframe。普通站点标签页和 AI 页面内部的
   // 同源子 frame 也会命中 manifest；后者若上报相同 siteId，会覆盖正确
   // frameId，导致后续指令被投递到没有输入框的子 frame。
@@ -39,6 +87,10 @@
      */
     if (msg.type === 'prepare') {
       const files = msg.files || [];
+      const previousAnswer = A.latestAnswer(site, document);
+      const answerBaselineLength = previousAnswer ? previousAnswer.length : 0;
+      const answerBaselineSignature = answerSignature(previousAnswer);
+      const answerBaselineCount = A.answerCount(site, document);
 
       /*
        * 先注入附件再填文字：注入后站点立刻开始上传，这段时间正好用来填文字，
@@ -81,8 +133,11 @@
          * 再等一遍等的是同一个信号，只会白卡满 uploadMs（表现为长时间"上传中"）。
          */
         const shouldWaitUpload = attached && via !== 'unverified';
+        const armTimeout = files.length
+          ? Math.max(msg.armMs || 2500, msg.uploadMs || 15000)
+          : (msg.armMs || 2500);
         const [armed, uploaded] = await Promise.all([
-          A.waitSendable(site, document, msg.armMs),
+          A.waitSendable(site, document, armTimeout),
           shouldWaitUpload
             ? A.waitForUploads(site, document, baseline, attached, msg.uploadMs)
             : Promise.resolve(true),
@@ -90,7 +145,17 @@
 
         // 上传没等到确认也放行：可能只是选择器认不出缩略图，不代表真的失败。
         if (attached && !uploaded && !fileError) fileError = '未能确认附件上传完成';
-        return { ok: true, armed, attached, via, fileError, siteId: site.id };
+        return {
+          ok: true,
+          armed,
+          attached,
+          via,
+          fileError,
+          answerBaselineLength,
+          answerBaselineSignature,
+          answerBaselineCount,
+          siteId: site.id,
+        };
       })()
         .then(respond)
         .catch((e) => respond({ ok: false, error: e.message, siteId: site.id }));
@@ -111,12 +176,25 @@
 
     if (msg.type === 'peek') {
       const t = A.latestAnswer(site, document);
-      respond({ ok: true, siteId: site.id, length: t ? t.length : 0 });
+      respond({
+        ok: true,
+        siteId: site.id,
+        length: t ? t.length : 0,
+        signature: answerSignature(t),
+        answerCount: A.answerCount(site, document),
+      });
       return true;
     }
 
     if (msg.type === 'collect') {
-      A.waitForStableAnswer(site, document, null, msg.maxWait)
+      const answerPromise = typeof msg.baselineSignature === 'string'
+        ? waitForFreshStableAnswer(
+            msg.baselineSignature,
+            msg.baselineAnswerCount,
+            msg.maxWait
+          )
+        : A.waitForStableAnswer(site, document, null, msg.maxWait);
+      answerPromise
         .then((text) =>
           respond({ ok: true, siteId: site.id, name: site.name, text: text || null })
         )
