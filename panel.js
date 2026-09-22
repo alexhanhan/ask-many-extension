@@ -234,12 +234,13 @@ function applyOrder() {
   const main = $('#cols');
   const visible = state.order.filter((id) => state.enabled.has(id));
 
-  // 1. 让 main 内的列 DOM 顺序与 visible 保持一致，偶数位给 col，奇数位留给 resizer
+  // 1. 设置当前可见列的 CSS order，偶数位给 col，奇数位留给 resizer
+  // 注意：绝对不能调用 main.appendChild(col)！在 DOM 中移动包含 iframe 的节点会导致浏览器重载 iframe 并刷新页面！
+  // Flex 容器内通过 CSS order 即可控制视觉排列，完全无需变动 DOM 树。
   visible.forEach((id, idx) => {
     const col = document.getElementById(`col-${id}`);
     if (col && main) {
       col.style.order = String(idx * 2);
-      main.appendChild(col);
     }
   });
 
@@ -309,7 +310,7 @@ function syncColResizers() {
   const visibleIds = state.order.filter((id) => state.enabled.has(id));
   if (visibleIds.length <= 1) return;
 
-  // 4. 在相邻列之间插入 resizer
+  // 4. 在相邻列之间插入 resizer（通过 CSS order 置于两列之间，无需移动列 DOM）
   for (let i = 0; i < visibleIds.length - 1; i++) {
     const leftId = visibleIds[i];
     const rightId = visibleIds[i + 1];
@@ -341,7 +342,7 @@ function syncColResizers() {
       resizer.setAttribute('aria-disabled', 'false');
     }
 
-    leftCol.after(resizer);
+    main.appendChild(resizer);
     bindColResizer(resizer, leftCol, rightCol, leftId, rightId);
   }
 }
@@ -617,24 +618,35 @@ function buildHeader() {
 function buildCols() {
   const main = $('#cols');
 
-  // 已存在的列保留，避免重建 iframe 把会话刷掉。
+  // 已存在的列只切换显示/隐藏（打开/关闭），严禁重建或从 DOM 中移除，以保护 iframe 实例不被刷新
   for (const a of A.ADAPTERS) {
     const existing = document.getElementById(`col-${a.id}`);
     const on = state.enabled.has(a.id);
-    if (on && !existing) {
-      main.append(makeCol(a));
-    } else if (!on && existing) {
-      existing.remove();
-      state.frames.delete(a.id);
-      if (state.maximized === a.id) state.maximized = null;
-      state.collapsed.delete(a.id);
-      if (state.judgeId === a.id) setJudge(null);
+    if (on) {
+      if (!existing) {
+        main.append(makeCol(a));
+      } else {
+        existing.classList.remove('col-closed');
+        existing.style.display = '';
+      }
+    } else if (existing) {
+      existing.classList.add('col-closed');
+      existing.style.display = 'none';
+      if (state.maximized === a.id) {
+        toggleMaximize(a.id);
+      }
+      if (state.judgeId === a.id) {
+        setJudge(null);
+      }
     }
   }
   paintDots();
   applyOrder();
   updateCount();
   populateJudgeSelect();
+  requestAnimationFrame(() => {
+    window.dispatchEvent(new Event('resize'));
+  });
 }
 
 function updateCount() {
@@ -1564,6 +1576,7 @@ function cacheRunAnswers(run, results) {
       id: result.id,
       name: result.name || adapter?.name || result.id,
       text: result.text,
+      signature: result.signature || null,
       isJudge: result.id === run.judgeId,
     };
   }
@@ -1588,16 +1601,17 @@ async function monitorAndSynthesize(run) {
     setMeta(judgeId, `👑 裁判就位 (等待 ${waitIds.length} 家模型作答…)`);
   }
 
-  const pollInterval = 2500;
+  const pollInterval = 1200; // 轮询周期缩短至 1.2 秒，大幅提升感知敏捷度
   const maxWaitMs = 150000;
   const startTime = Date.now();
   const lastSignatures = new Map();
   const stableRounds = new Map();
   const answerStarted = new Map();
+  const inFlightCollects = new Set(); // 正在渐进式预提取回答的模型 ID
   let pollInFlight = false;
 
-  // 延迟 4 秒后再开始检查，给各模型初次响应留出时间
-  await new Promise((resolve) => setTimeout(resolve, 4000));
+  // 延迟 1.8 秒后再开始检查，给各模型初次响应留出必要时间
+  await new Promise((resolve) => setTimeout(resolve, 1800));
   if (token !== activeSynthesisToken || state.currentRun !== run) return;
 
   const timer = setInterval(async () => {
@@ -1622,7 +1636,7 @@ async function monitorAndSynthesize(run) {
       let answeredCount = 0;
 
       for (const id of waitIds) {
-        const r = await send(id, { type: 'peek' }, 3000);
+        const r = await send(id, { type: 'peek' }, 2500);
         if (r.ok) {
           const len = r.length || 0;
           const signature = r.signature || `length:${len}`;
@@ -1651,11 +1665,38 @@ async function monitorAndSynthesize(run) {
           if (len > 0 && signature === prev) {
             const rounds = (stableRounds.get(id) || 0) + 1;
             stableRounds.set(id, rounds);
-            if (rounds < 2) allStable = false;
+            if (rounds < 2) {
+              allStable = false;
+            } else {
+              // 关键优化：先答完的模型先提取（渐进式提前提取）
+              // 某个模型连续 2 轮无变化即判定回答完成，无需等待其他模型一起答完
+              if (!run.answers?.[id] && !inFlightCollects.has(id)) {
+                inFlightCollects.add(id);
+                send(id, { type: 'collect', immediate: true }, 8000).then((collectRes) => {
+                  inFlightCollects.delete(id);
+                  if (collectRes?.ok && collectRes?.text && state.currentRun === run) {
+                    cacheRunAnswers(run, [{
+                      id,
+                      text: collectRes.text,
+                      name: collectRes.name,
+                      signature,
+                      ok: true,
+                    }]);
+                    setMeta(id, `${collectRes.text.length} 字 ✓`);
+                    updateProgressMeta();
+                  }
+                }).catch(() => inFlightCollects.delete(id));
+              }
+            }
           } else {
+            // 文本仍在持续增长（或网络短暂波动后继续输出）
             lastSignatures.set(id, signature);
             stableRounds.set(id, 0);
             allStable = false;
+            // 若内容继续增长，清除旧缓存以保证最终回答完整
+            if (run.answers?.[id] && run.answers[id].signature !== signature) {
+              delete run.answers[id];
+            }
           }
         } else {
           // frame 无响应或异常，不卡死流程
@@ -1663,13 +1704,27 @@ async function monitorAndSynthesize(run) {
         }
       }
 
-      if (answeredCount > 0) {
+      function updateProgressMeta() {
+        const collectedCount = waitIds.filter((id) => Boolean(run.answers?.[id])).length;
         const prefix = run.judgeAnswersQuestion ? '👑 首轮回答中' : '👑 裁判就位';
-        setMeta(judgeId, `${prefix} (已作答: ${answeredCount}/${waitIds.length} 家)`);
+        if (collectedCount > 0 && collectedCount === waitIds.length) {
+          setMeta(judgeId, `${prefix} (全员已收集，准备裁决…)`);
+        } else if (collectedCount > 0) {
+          setMeta(judgeId, `${prefix} (已提取: ${collectedCount}/${waitIds.length} 家)`);
+        } else if (answeredCount > 0) {
+          setMeta(judgeId, `${prefix} (已作答: ${answeredCount}/${waitIds.length} 家)`);
+        }
       }
 
-      // 至少有一家有文字输出，且所有有回答的模型均已稳定 2 轮（至少 5 秒不再增长）
-      if (anyAnswered && allStable) {
+      updateProgressMeta();
+
+      // 检查所有参与模型是否均已稳定且在途预提取均已就绪
+      const allRoundsComplete = waitIds.every((id) => {
+        const rounds = stableRounds.get(id) || 0;
+        return rounds >= 2 || rounds === 99;
+      });
+
+      if (anyAnswered && allStable && allRoundsComplete && inFlightCollects.size === 0) {
         clearInterval(timer);
         if (token === activeSynthesisToken) {
           triggerAutoSynthesis(run, token);
@@ -1688,26 +1743,35 @@ async function triggerAutoSynthesis(run, token) {
   const judgeAdapter = A.byId(judgeId);
   const judgeName = judgeAdapter ? judgeAdapter.name : judgeId;
 
-  setMeta(judgeId, '👑 提取各模型作答…');
-  const results = await Promise.all(
-    waitIds.map((id) =>
-      send(id, {
-        type: 'collect',
-        maxWait: 8000,
-        ...(typeof run.answerBaselines?.[id] === 'string'
-          ? {
-              baselineSignature: run.answerBaselines[id],
-              baselineAnswerCount: run.answerBaselineCounts?.[id],
-            }
-          : {}),
-      }, 12000).then((r) => ({ id, ...r }))
-    )
-  );
+  // 检查是否有尚未完成提取的模型（如最后刚答完的模型）
+  const missingIds = waitIds.filter((id) => !run.answers?.[id]);
+  if (missingIds.length > 0) {
+    setMeta(judgeId, '👑 秒级提取剩余作答…');
+    const results = await Promise.all(
+      missingIds.map((id) =>
+        send(id, {
+          type: 'collect',
+          immediate: true, // 关键：immediate 模式直读当前文本，跳过所有多余的 2 秒睡眠轮询！
+          maxWait: 8000,
+          ...(typeof run.answerBaselines?.[id] === 'string'
+            ? {
+                baselineSignature: run.answerBaselines[id],
+                baselineAnswerCount: run.answerBaselineCounts?.[id],
+              }
+            : {}),
+        }, 12000).then((r) => ({ id, ...r }))
+      )
+    );
 
-  if ((token && token !== activeSynthesisToken) || state.currentRun !== run ||
-      state.judgeId !== run.judgeId || !state.autoJudge) return;
+    if ((token && token !== activeSynthesisToken) || state.currentRun !== run ||
+        state.judgeId !== run.judgeId || !state.autoJudge) return;
 
-  cacheRunAnswers(run, results);
+    cacheRunAnswers(run, results);
+    for (const r of results) {
+      if (r.ok && r.text) setMeta(r.id, `${r.text.length} 字 ✓`);
+    }
+  }
+
   const entries = comparisonEntries(run);
 
   if (run.judgeIncludedInComparison && !run.answers?.[judgeId]) {

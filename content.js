@@ -187,6 +187,18 @@
     }
 
     if (msg.type === 'collect') {
+      if (msg.immediate) {
+        const text = A.latestAnswer(site, document);
+        respond({
+          ok: true,
+          siteId: site.id,
+          name: site.name,
+          text: text || null,
+          signature: answerSignature(text),
+        });
+        return true;
+      }
+
       const answerPromise = typeof msg.baselineSignature === 'string'
         ? waitForFreshStableAnswer(
             msg.baselineSignature,
@@ -196,7 +208,13 @@
         : A.waitForStableAnswer(site, document, null, msg.maxWait);
       answerPromise
         .then((text) =>
-          respond({ ok: true, siteId: site.id, name: site.name, text: text || null })
+          respond({
+            ok: true,
+            siteId: site.id,
+            name: site.name,
+            text: text || null,
+            signature: answerSignature(text),
+          })
         )
         .catch((e) => respond({ ok: false, error: e.message, siteId: site.id }));
       return true;
