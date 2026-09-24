@@ -1173,7 +1173,12 @@ function makeCol(a) {
   });
   participationBar.append(askParticipation.label, compareParticipation.label);
 
-  const frame = el('iframe', { src: a.url, id: `if-${a.id}` });
+  // 跨域 iframe 需显式允许写入剪贴板，否则站点的回答/代码块复制会被浏览器拦截。
+  const frame = el('iframe', {
+    src: a.url,
+    id: `if-${a.id}`,
+    allow: 'clipboard-write',
+  });
 
   const fb = el('div', { className: 'fallback' });
   fb.append(
