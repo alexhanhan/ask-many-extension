@@ -22,11 +22,10 @@
       answers: (d) => d.querySelectorAll('[data-message-author-role="assistant"]'),
       inputSettleMs: 150,
 
-      // 附件支持：ChatGPT 原生支持隐藏的 input[type=file]，且对 paste 和 drop
-      // 都会响应。若不限制 fileRoutes，在缩略图识别稍有延迟时会依次触发 paste、input、drop，
-      // 导致同一附件被连续上传多次。固定走 input 路径，图片和文档均适用且最稳定。
+      // 附件支持：ChatGPT 对合成 paste（模拟 Ctrl+V 贴图）天然支持且最可靠。
+      // 优先走 paste 贴图路径，若未成功再回退 input / drop。
       supportsFiles: true,
-      fileRoutes: ['input'],
+      fileRoutes: ['paste', 'input', 'drop'],
       fileInput: (d) => {
         const composer =
           d.querySelector('#prompt-textarea')?.closest('form') ||
@@ -45,6 +44,7 @@
           d.querySelector('#prompt-textarea')?.closest('form') ||
           d.querySelector('#prompt-textarea')?.closest('div[class*="composer"]') ||
           d.querySelector('#prompt-textarea')?.parentElement?.parentElement?.parentElement ||
+          d.querySelector('main') ||
           d;
         return composer.querySelectorAll(
           'button[aria-label*="Remove" i], button[aria-label*="删除" i], button[aria-label*="Delete" i], ' +
