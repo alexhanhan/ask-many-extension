@@ -11,6 +11,8 @@
   const site = A.bySite(location.hostname);
   if (!site) return;
 
+  const diagnosticVersion = 'judge-20260928-3';
+
   const answerSignature = (text) => {
     if (!text) return '';
     let hash = 2166136261;
@@ -69,7 +71,10 @@
   // 让面板知道"我在这个 frame 里，可以接指令了"。
   // iframe 内的 content script 无法直接被面板 postMessage 找到（跨源），
   // 所以走 runtime 消息由 background 按 frameId 投递。
-  chrome.runtime.sendMessage({ type: 'frame-ready', siteId: site.id, inFrame }).catch(() => {});
+  console.info(`[同问诊断][${diagnosticVersion}][${site.id}] 站点脚本已加载`);
+  chrome.runtime.sendMessage({
+    type: 'frame-ready', siteId: site.id, inFrame, diagnosticVersion,
+  }).catch((error) => console.warn('[同问诊断] 站点注册失败', site.id, error.message));
 
   chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
     if (!msg || msg.siteId !== site.id) return false;
@@ -182,6 +187,8 @@
         length: t ? t.length : 0,
         signature: answerSignature(t),
         answerCount: A.answerCount(site, document),
+        diagnosticVersion,
+        diagnostics: A.answerDiagnostics?.(site, document) ?? null,
       });
       return true;
     }

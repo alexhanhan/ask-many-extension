@@ -6,6 +6,54 @@
 (function (root) {
   'use strict';
 
+  const CHATGPT_ANSWER_SELECTORS = [
+    '[data-content-search-unit-key$=":assistant"]',
+    '[data-markdown-text-style="assistant-message"]',
+    '[data-message-author-role="assistant"]',
+    '[data-turn="assistant"]',
+    'main [data-testid^="conversation-turn-"] .markdown',
+    'main .agent-turn .markdown',
+    'main article .markdown',
+    'main .markdown',
+  ];
+  const CHATGPT_USER_MESSAGE = '[data-content-search-unit-key$=":user"], ' +
+    '[data-user-message-bubble], [data-message-author-role="user"], [data-turn="user"]';
+  const CHATGPT_NON_ANSWER = CHATGPT_USER_MESSAGE + ', form, [contenteditable="true"], nav, aside';
+  const CHATGPT_ANSWER_BODY = '[data-markdown-text-style="assistant-message"], .markdown';
+
+  function chatgptAnswers(doc) {
+    const candidates = Array.from(doc.querySelectorAll(CHATGPT_ANSWER_SELECTORS.join(', ')))
+      .filter((node) => !node.closest(CHATGPT_NON_ANSWER));
+    // 兼容新旧结构混用；同一轮可能同时命中外层 assistant 和内层 markdown。
+    const roots = candidates.filter((node) =>
+      !candidates.some((parent) => parent !== node && parent.contains(node))
+    );
+    const turns = new Set();
+    return roots.map((node) => {
+      const turn = node.closest('[data-content-search-unit-key$=":assistant"], [data-testid^="conversation-turn-"], article');
+      // 将同一轮中的多个正文块合并，避免只提取最后一段。
+      const root = turn && !turn.querySelector(CHATGPT_USER_MESSAGE)
+        ? turn : node;
+      if (turns.has(root)) return null;
+      turns.add(root);
+      return root;
+    }).filter(Boolean);
+  }
+
+  function chatgptAnswerText(node) {
+    const blocks = Array.from(node.querySelectorAll(CHATGPT_ANSWER_BODY))
+      .filter((block) => !block.closest(CHATGPT_NON_ANSWER));
+    const outerBlocks = blocks.filter((block) =>
+      !blocks.some((parent) => parent !== block && parent.contains(block))
+    );
+    // 新结构会先出现角色标题，正文节点尚未挂载时不能将标题当成回答。
+    if (!outerBlocks.length && node.matches('[data-content-search-unit-key$=":assistant"]') &&
+        !node.matches(CHATGPT_ANSWER_BODY)) return '';
+    return outerBlocks.length
+      ? outerBlocks.map((block) => (block.innerText || '').trim()).filter(Boolean).join('\n\n')
+      : (node.innerText || '').trim();
+  }
+
   const ADAPTERS = [
     {
       id: 'chatgpt',
@@ -19,7 +67,13 @@
       sendBtn: (d) =>
         d.querySelector('button[data-testid="send-button"]') ||
         d.querySelector('button[aria-label*="Send" i]'),
-      answers: (d) => d.querySelectorAll('[data-message-author-role="assistant"]'),
+      answers: chatgptAnswers,
+      answerText: chatgptAnswerText,
+      answerDiagnostics: (d) => ({
+        selectorMatches: CHATGPT_ANSWER_SELECTORS.map((selector) => ({
+          selector, count: d.querySelectorAll(selector).length,
+        })),
+      }),
       inputSettleMs: 150,
 
       // 附件支持：ChatGPT 对合成 paste（模拟 Ctrl+V 贴图）天然支持且最可靠。
@@ -1106,13 +1160,30 @@
   function latestAnswer(site, doc) {
     const nodes = site.answers(doc);
     if (!nodes || !nodes.length) return null;
-    const text = (nodes[nodes.length - 1].innerText || '').trim();
+    const node = nodes[nodes.length - 1];
+    // 最新一轮为空时不能回退到旧回答，否则会将上一轮正文交给裁判。
+    const text = site.answerText ? site.answerText(node) : (node.innerText || '').trim();
     return text || null;
   }
 
   function answerCount(site, doc) {
     const nodes = site.answers(doc);
     return nodes?.length || 0;
+  }
+
+  // 仅输出结构和长度，控制台诊断不包含对话正文。
+  function answerDiagnostics(site, doc) {
+    const nodes = Array.from(site.answers(doc) || []);
+    return {
+      nodeCount: nodes.length,
+      ...(site.answerDiagnostics?.(doc) || {}),
+      tailNodes: nodes.slice(-3).map((node, offset) => ({
+        index: Math.max(0, nodes.length - 3) + offset,
+        tag: node.tagName,
+        innerTextLength: (node.innerText || '').trim().length,
+        textContentLength: (node.textContent || '').trim().length,
+      })),
+    };
   }
 
   /*
@@ -1256,7 +1327,7 @@ ${blocks}
     ADAPTERS, bySite, byId,
     fillInput, fillInputVerified, normText, sendable, waitSendable, submit, submitVerified, pressEnter,
     attachFiles, waitForUploads, base64ToFile, countChips, pasteFiles, setFileInput,
-    latestAnswer, answerCount, waitForStableAnswer, buildComparePrompt,
+    latestAnswer, answerCount, answerDiagnostics, waitForStableAnswer, buildComparePrompt,
     POLL_MS, STABLE_ROUNDS, MAX_WAIT_MS, sleep,
   };
 })(typeof globalThis !== 'undefined' ? globalThis : self);

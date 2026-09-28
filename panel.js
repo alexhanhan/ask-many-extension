@@ -9,6 +9,13 @@ const A = globalThis.AskManyAdapters;
 const $ = (s) => document.querySelector(s);
 const el = (t, p = {}) => Object.assign(document.createElement(t), p);
 
+const DIAGNOSTIC_VERSION = 'judge-20260928-3';
+function logDiagnostic(event, details = {}) {
+  // 序列化为当时的快照，避免展开控制台对象时看到后续变更；不传对话正文。
+  console.info(`[同问诊断][${DIAGNOSTIC_VERSION}][${new Date().toISOString()}] ${event} ${JSON.stringify(details)}`);
+}
+logDiagnostic('工作台脚本已加载');
+
 const STORE_KEY = 'askmany:enabled';
 const STORE_ORDER_KEY = 'askmany:order';
 const STORE_LAYOUT_KEY = 'askmany:layout';
@@ -206,13 +213,36 @@ function renderChips() {
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg?.type === 'frame-ready' && sender.tab && sender.frameId != null) {
     state.frames.set(msg.siteId, { tabId: sender.tab.id, frameId: sender.frameId });
+    logDiagnostic('站点已连接', {
+      siteId: msg.siteId, frameId: sender.frameId,
+      contentVersion: msg.diagnosticVersion || '旧版/未提供',
+      versionMatches: msg.diagnosticVersion === DIAGNOSTIC_VERSION,
+    });
     paintDots();
   }
 });
 
 function send(siteId, payload, timeoutMs = 200000) {
   const f = state.frames.get(siteId);
-  if (!f) return Promise.resolve({ ok: false, error: 'frame 未就绪' });
+  const startedAt = Date.now();
+  const traced = ['prepare', 'fire', 'collect'].includes(payload.type);
+  const report = (result) => {
+    if (traced || !result.ok) {
+      logDiagnostic('站点指令结果', {
+        siteId, type: payload.type, frameId: f?.frameId,
+        elapsedMs: Date.now() - startedAt, ok: result.ok, error: result.error,
+        textLength: result.text?.length, signature: result.signature,
+        baselineSignature: result.answerBaselineSignature,
+        baselineCount: result.answerBaselineCount,
+      });
+    }
+    return result;
+  };
+  if (traced) logDiagnostic('发送站点指令', {
+    siteId, type: payload.type, frameId: f?.frameId, timeoutMs,
+    immediate: Boolean(payload.immediate),
+  });
+  if (!f) return Promise.resolve(report({ ok: false, error: 'frame 未就绪' }));
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve({ ok: false, error: '超时' }), timeoutMs);
     chrome.runtime.sendMessage(
@@ -222,7 +252,7 @@ function send(siteId, payload, timeoutMs = 200000) {
         resolve(res ?? { ok: false, error: chrome.runtime.lastError?.message ?? '无响应' });
       }
     );
-  });
+  }).then(report);
 }
 
 // --------------------------------------------------------------------- 排序与持久化
@@ -1262,6 +1292,12 @@ async function ask() {
   };
   state.currentRun = run;
 
+  logDiagnostic('新一轮提问', {
+    judgeId, judgeAnswersQuestion, judgeIncludedInComparison,
+    askedIds: run.askedIds, comparisonIds: run.plannedComparisonIds,
+    autoJudge: state.autoJudge, autoSend: $('#autosend').checked,
+  });
+
   state.busy = true;
   $('#go').disabled = true;
   lastQuestion = text;
@@ -1343,6 +1379,7 @@ async function ask() {
     (id) => id !== judgeId || judgeIncludedInComparison
   );
   if (!autoSend) {
+    logDiagnostic('未启动自动监控：仅填入模式', { judgeId, ready });
     $('#status').textContent = `${ready.length}/${askTargets.length} 已填入（未自动发送，请在各栏手动发）`;
     state.busy = false;
     $('#go').disabled = false;
@@ -1355,6 +1392,11 @@ async function ask() {
     ready.map((id) => send(id, { type: 'peek' }, 3000).then((r) => ({ id, ...r })))
   );
   for (const baseline of baselineResults) {
+    logDiagnostic('发送前回答基线', {
+      siteId: baseline.id, ok: baseline.ok, error: baseline.error,
+      length: baseline.length, signature: baseline.signature, answerCount: baseline.answerCount,
+      contentVersion: baseline.diagnosticVersion || '旧版/未提供', diagnostics: baseline.diagnostics,
+    });
     if (!baseline.ok) continue;
     run.answerBaselines[baseline.id] = baseline.signature || `length:${baseline.length || 0}`;
     run.answerBaselineCounts[baseline.id] = Number.isFinite(baseline.answerCount)
@@ -1370,6 +1412,7 @@ async function ask() {
   const sentIds = fired.filter((f) => f.ok).map((f) => f.id);
   run.firedIds = [...sentIds];
   run.waitIds = [...sentIds];
+  logDiagnostic('本轮发送完成', { sentIds, judgeId, autoJudge: state.autoJudge });
   run.comparisonIds = sentIds.filter(
     (id) => id !== judgeId || judgeIncludedInComparison
   );
@@ -1390,8 +1433,15 @@ async function ask() {
     if (judgeId && state.judgeId === judgeId && state.autoJudge && hasNonJudgeAnswer) {
       monitorAndSynthesize(run);
     } else if (judgeId && !hasNonJudgeAnswer && judgeAnswersQuestion) {
+      logDiagnostic('未启动自动监控：没有其他模型参与比对', { judgeId, sentIds });
       setMeta(judgeId, '👑 已参与回答（无其他回答可比对）');
+    } else {
+      logDiagnostic('未启动自动监控', {
+        judgeId, currentJudgeId: state.judgeId, autoJudge: state.autoJudge, hasNonJudgeAnswer,
+      });
     }
+  } else {
+    logDiagnostic('未启动自动监控：没有模型发送成功', { judgeId });
   }
 
   state.busy = false;
@@ -1542,9 +1592,11 @@ function dispatchRunToJudge(run, prompt) {
   if (run.dispatchPromise) return run.dispatchPromise;
 
   run.dispatchInFlight = true;
+  logDiagnostic('开始派发裁判', { judgeId: run.judgeId, cachedIds: Object.keys(run.answers || {}) });
   updateDlgJudgeButton();
   const attempt = dispatchToJudge(run.judgeId, prompt, run)
     .then((result) => {
+      logDiagnostic('裁判派发结果', { judgeId: run.judgeId, ok: result?.ok, error: result?.error });
       run.dispatchInFlight = false;
       if (result?.ok) {
         run.comparisonDispatched = true;
@@ -1555,6 +1607,7 @@ function dispatchRunToJudge(run, prompt) {
       return result;
     })
     .catch((error) => {
+      logDiagnostic('裁判派发异常', { judgeId: run.judgeId, error: error?.message || String(error) });
       state.lockedSites.delete(run.judgeId);
       run.dispatchInFlight = false;
       run.dispatchPromise = null;
@@ -1584,6 +1637,10 @@ function cacheRunAnswers(run, results) {
       signature: result.signature || null,
       isJudge: result.id === run.judgeId,
     };
+    logDiagnostic('回答已缓存', {
+      siteId: result.id, textLength: result.text.length, signature: result.signature,
+      collectedIds: Object.keys(run.answers),
+    });
   }
 }
 
@@ -1597,6 +1654,10 @@ async function monitorAndSynthesize(run) {
   const { waitIds, judgeId, question } = run;
   if (state.currentRun !== run || state.judgeId !== judgeId || !state.autoJudge) return;
   const token = ++activeSynthesisToken;
+  logDiagnostic('开始监控首轮回答', {
+    token, judgeId, waitIds, comparisonIds: run.comparisonIds,
+    baselines: run.answerBaselines, baselineCounts: run.answerBaselineCounts,
+  });
 
   if (isDuelRun(run)) {
     setMeta(judgeId, `👑 裁判就位 (单挑模式: 等待作答后亲自解答并裁决…)`);
@@ -1614,6 +1675,7 @@ async function monitorAndSynthesize(run) {
   const answerStarted = new Map();
   const inFlightCollects = new Set(); // 正在渐进式预提取回答的模型 ID
   let pollInFlight = false;
+  let lastPollLogAt = 0;
 
   // 延迟 1.8 秒后再开始检查，给各模型初次响应留出必要时间
   await new Promise((resolve) => setTimeout(resolve, 1800));
@@ -1624,14 +1686,21 @@ async function monitorAndSynthesize(run) {
     pollInFlight = true;
     try {
       if (token !== activeSynthesisToken || state.currentRun !== run) {
+        logDiagnostic('监控已取消', { token, activeToken: activeSynthesisToken });
         clearInterval(timer);
         return;
       }
 
       if (Date.now() - startTime > maxWaitMs) {
+        logDiagnostic('监控超时，进入最终收集', {
+          token, elapsedMs: Date.now() - startTime,
+          missingIds: waitIds.filter((id) => !run.answers?.[id]),
+        });
         clearInterval(timer);
         if (token === activeSynthesisToken) {
-          triggerAutoSynthesis(run, token);
+          triggerAutoSynthesis(run, token).catch((error) => {
+            logDiagnostic('裁判最终收集异常', { token, error: error?.message || String(error) });
+          });
         }
         return;
       }
@@ -1639,9 +1708,16 @@ async function monitorAndSynthesize(run) {
       let allStable = true;
       let anyAnswered = false;
       let answeredCount = 0;
+      const pollSnapshots = [];
 
       for (const id of waitIds) {
         const r = await send(id, { type: 'peek' }, 2500);
+        const snapshot = {
+          siteId: id, ok: r.ok, error: r.error, length: r.length,
+          signature: r.signature, answerCount: r.answerCount,
+          contentVersion: r.diagnosticVersion || '旧版/未提供', diagnostics: r.diagnostics,
+        };
+        pollSnapshots.push(snapshot);
         if (r.ok) {
           const len = r.length || 0;
           const signature = r.signature || `length:${len}`;
@@ -1657,6 +1733,13 @@ async function monitorAndSynthesize(run) {
             started = true;
             answerStarted.set(id, true);
           }
+
+          Object.assign(snapshot, {
+            started, hasNewNode, matchesBaseline: signature === baseline,
+            baselineSignature: baseline, baselineCount,
+            reason: !started ? '仍与发送前基线相同' : !len ? '未读到回答正文'
+              : signature !== lastSignatures.get(id) ? '回答变化，重新等待稳定' : '回答内容稳定',
+          });
 
           if (!started) {
             allStable = false;
@@ -1690,7 +1773,10 @@ async function monitorAndSynthesize(run) {
                     setMeta(id, `${collectRes.text.length} 字 ✓`);
                     updateProgressMeta();
                   }
-                }).catch(() => inFlightCollects.delete(id));
+                }).catch((error) => {
+                  inFlightCollects.delete(id);
+                  logDiagnostic('提前提取异常', { token, siteId: id, error: error?.message || String(error) });
+                });
               }
             }
           } else {
@@ -1700,6 +1786,7 @@ async function monitorAndSynthesize(run) {
             allStable = false;
             // 若内容继续增长，清除旧缓存以保证最终回答完整
             if (run.answers?.[id] && run.answers[id].signature !== signature) {
+              logDiagnostic('回答变化，清除旧缓存', { token, siteId: id, signature });
               delete run.answers[id];
             }
           }
@@ -1729,12 +1816,31 @@ async function monitorAndSynthesize(run) {
         return rounds >= 2 || rounds === 99;
       });
 
+      // 最多每 5 秒汇总一次，稳定轮数和各站点状态集中在工作台控制台查看。
+      if (Date.now() - lastPollLogAt >= 5000) {
+        lastPollLogAt = Date.now();
+        logDiagnostic('回答监控快照', {
+          token, elapsedMs: Date.now() - startTime, allStable, allRoundsComplete,
+          inFlightCollects: [...inFlightCollects],
+          missingIds: waitIds.filter((id) => !run.answers?.[id]),
+          sites: pollSnapshots.map((snapshot) => ({
+            ...snapshot, stableRounds: stableRounds.get(snapshot.siteId) || 0,
+            cached: Boolean(run.answers?.[snapshot.siteId]),
+          })),
+        });
+      }
+
       if (anyAnswered && allStable && allRoundsComplete && inFlightCollects.size === 0) {
+        logDiagnostic('稳定条件满足，进入裁判收集', { token });
         clearInterval(timer);
         if (token === activeSynthesisToken) {
-          triggerAutoSynthesis(run, token);
+          triggerAutoSynthesis(run, token).catch((error) => {
+            logDiagnostic('裁判最终收集异常', { token, error: error?.message || String(error) });
+          });
         }
       }
+    } catch (error) {
+      logDiagnostic('回答监控异常', { token, error: error?.message || String(error) });
     } finally {
       pollInFlight = false;
     }
@@ -1750,6 +1856,7 @@ async function triggerAutoSynthesis(run, token) {
 
   // 检查是否有尚未完成提取的模型（如最后刚答完的模型）
   const missingIds = waitIds.filter((id) => !run.answers?.[id]);
+  logDiagnostic('裁判最终收集', { token, judgeId, missingIds });
   if (missingIds.length > 0) {
     setMeta(judgeId, '👑 秒级提取剩余作答…');
     const results = await Promise.all(
@@ -1779,13 +1886,21 @@ async function triggerAutoSynthesis(run, token) {
 
   const entries = comparisonEntries(run);
 
+  logDiagnostic('裁判收集汇总', {
+    token, judgeId, plannedIds: run.comparisonIds,
+    collectedIds: entries.map((entry) => entry.id),
+    missingIds: waitIds.filter((id) => !run.answers?.[id]),
+  });
+
   if (run.judgeIncludedInComparison && !run.answers?.[judgeId]) {
+    logDiagnostic('裁判停止：缺少裁判首轮回答', { token, judgeId });
     setMeta(judgeId, '👑 未抓到裁判首轮回答，已停止自动评测');
     $('#status').textContent = '裁判已设置参与比对，但未抓到它的首轮回答；本轮未自动派发裁决';
     return;
   }
 
   if (!entries.some((entry) => entry.id !== judgeId)) {
+    logDiagnostic('裁判停止：缺少其他模型回答', { token, judgeId });
     setMeta(judgeId, '👑 未抓到有效回答');
     return;
   }
