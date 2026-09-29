@@ -1343,36 +1343,47 @@ async function ask() {
    */
   const verifyMs = files.length ? 2500 : 0;
 
-  /*
-   * 两阶段派发，这样各站点是真的"同时"提交：
-   *   1. prepare 并发下发 —— 各站点填入文本并等自己的发送按钮就绪。
-   *      这一步耗时因站点而异（ChatGPT 的按钮几乎立刻可用，有些站点要等上一两秒）。
-   *   2. 全部就绪后再并发 fire —— 提交环节不含任何等待，各家几乎在同一瞬间发出。
-   */
+  // 各站点独立完成 prepare → 基线 → fire；慢站点不阻塞已就绪的站点。
+  const fired = [];
   const prepared = await Promise.all(
     askTargets.map((id) =>
       send(id, { type: 'prepare', text, files: filesFor(id), armMs: 2500, uploadMs, verifyMs },
            prepareTimeout)
-        .then((r) => {
+        .then(async (r) => {
           const p = { id, ...r };
-          if (!p.ok) setMeta(p.id, `失败: ${p.error}`);
-          else {
-            const base = autoSend ? '待发送' : '已填入';
-            setMeta(p.id, p.fileError ? `${base}（附件: ${p.fileError}）`
-                                      : p.attached ? `${base}（${p.attached} 附件）` : base);
+          if (!p.ok) {
+            setMeta(p.id, `失败: ${p.error}`);
+            return p;
           }
+
+          run.answerBaselines[id] = p.answerBaselineSignature ?? null;
+          run.answerBaselineCounts[id] = Number.isFinite(p.answerBaselineCount)
+            ? p.answerBaselineCount : null;
+          const base = autoSend ? '发送中' : '已填入';
+          setMeta(id, p.fileError ? `${base}（附件: ${p.fileError}）`
+                                    : p.attached ? `${base}（${p.attached} 附件）` : base);
+          if (!autoSend) return p;
+
+          // 在本站点提交前刷新基线，避免准备期间旧回答增长影响本轮判定。
+          const baseline = await send(id, { type: 'peek' }, 3000);
+          logDiagnostic('发送前回答基线', {
+            siteId: id, ok: baseline.ok, error: baseline.error,
+            length: baseline.length, signature: baseline.signature, answerCount: baseline.answerCount,
+            contentVersion: baseline.diagnosticVersion || '旧版/未提供', diagnostics: baseline.diagnostics,
+          });
+          if (baseline.ok) {
+            run.answerBaselines[id] = baseline.signature || `length:${baseline.length || 0}`;
+            run.answerBaselineCounts[id] = Number.isFinite(baseline.answerCount)
+              ? baseline.answerCount : null;
+          }
+          const result = { id, ...await send(id, { type: 'fire' }, 15000) };
+          fired.push(result);
+          setMeta(id, result.ok ? '已发送' : `发送失败: ${result.error}`);
           return p;
         }))
   );
 
   const ready = prepared.filter((p) => p.ok).map((p) => p.id);
-  for (const p of prepared) {
-    if (!p.ok) continue;
-    run.answerBaselines[p.id] = p.answerBaselineSignature ?? null;
-    run.answerBaselineCounts[p.id] = Number.isFinite(p.answerBaselineCount)
-      ? p.answerBaselineCount
-      : null;
-  }
   run.preparedIds = [...ready];
   run.waitIds = [...ready];
   run.comparisonIds = ready.filter(
@@ -1386,30 +1397,7 @@ async function ask() {
     return;
   }
 
-  // prepare 可能持续数秒；在真正 fire 前重取一次基线，避免把期间仍在增长的旧回答
-  // 当成本轮的新回答。
-  const baselineResults = await Promise.all(
-    ready.map((id) => send(id, { type: 'peek' }, 3000).then((r) => ({ id, ...r })))
-  );
-  for (const baseline of baselineResults) {
-    logDiagnostic('发送前回答基线', {
-      siteId: baseline.id, ok: baseline.ok, error: baseline.error,
-      length: baseline.length, signature: baseline.signature, answerCount: baseline.answerCount,
-      contentVersion: baseline.diagnosticVersion || '旧版/未提供', diagnostics: baseline.diagnostics,
-    });
-    if (!baseline.ok) continue;
-    run.answerBaselines[baseline.id] = baseline.signature || `length:${baseline.length || 0}`;
-    run.answerBaselineCounts[baseline.id] = Number.isFinite(baseline.answerCount)
-      ? baseline.answerCount
-      : null;
-  }
-
-  const fired = await Promise.all(
-    ready.map((id) => send(id, { type: 'fire' }, 15000).then((r) => ({ id, ...r })))
-  );
-
-  for (const f of fired) setMeta(f.id, f.ok ? '已发送' : `发送失败: ${f.error}`);
-  const sentIds = fired.filter((f) => f.ok).map((f) => f.id);
+  const sentIds = ready.filter((id) => fired.some((f) => f.id === id && f.ok));
   run.firedIds = [...sentIds];
   run.waitIds = [...sentIds];
   logDiagnostic('本轮发送完成', { sentIds, judgeId, autoJudge: state.autoJudge });
@@ -1490,7 +1478,7 @@ async function dispatchToJudge(judgeId, prompt, run = null) {
     armMs: 2500,
     uploadMs: 0,
     verifyMs: 0,
-  }, 30000);
+  }, judgeId === 'gemini' ? 120000 : 30000);
 
   if (!prep.ok) {
     releaseJudgeLock();
