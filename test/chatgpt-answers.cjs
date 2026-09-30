@@ -60,7 +60,7 @@ listener({ type: 'peek', siteId: 'chatgpt' }, {}, (r) => { peek = r; });
 listener({ type: 'collect', siteId: 'chatgpt', immediate: true }, {}, (r) => { collected = r; });
 assert.equal(peek.answerCount, 1);
 assert.equal(peek.length, 3);
-assert.equal(peek.diagnosticVersion, 'judge-20260928-3');
+assert.equal(peek.diagnosticVersion, 'judge-20260930-1');
 assert(peek.diagnostics.selectorMatches.some((match) => match.count > 0));
 assert.equal(collected.text, '星期一');
 assert.equal(collected.signature, peek.signature);

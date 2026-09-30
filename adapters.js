@@ -226,7 +226,38 @@
         d.querySelector('button[aria-label*="Send" i]') ||
         d.querySelector('button[aria-label*="发送" i]') ||
         d.querySelector('.send-button-container button'),
-      answers: (d) => d.querySelectorAll('message-content'),
+      answers: (d) => {
+        const messages = d.querySelectorAll('message-content');
+        if (messages.length) return messages;
+        // 兼容 Gemini 未使用 message-content 包装的回答正文。
+        const markdown = d.querySelectorAll('.markdown, .response-content');
+        return markdown.length ? markdown : d.querySelectorAll('model-response');
+      },
+      answerDiagnostics: (d) => ({
+        readyState: d.readyState,
+        visibilityState: d.visibilityState,
+        selectorMatches: [
+          'message-content', 'model-response', 'model-response message-content',
+          '.markdown', '.response-content', 'model-response .markdown',
+          '.model-response-text', '[data-message-author-role="assistant"]',
+          'user-query', 'rich-textarea',
+        ].map((selector) => {
+          const nodes = Array.from(d.querySelectorAll(selector));
+          return {
+            selector, count: nodes.length,
+            tail: nodes.slice(-2).map((node) => ({
+              tag: node.tagName,
+              classes: String(node.className || '').slice(0, 160),
+              innerTextLength: (node.innerText || '').trim().length,
+              textContentLength: (node.textContent || '').trim().length,
+              insideEditor: Boolean(node.closest('[contenteditable="true"], rich-textarea')),
+              insideUser: Boolean(node.closest('user-query, [data-message-author-role="user"]')),
+              parentTag: node.parentElement?.tagName,
+              childTags: Array.from(node.children || []).slice(0, 12).map((child) => child.tagName),
+            })),
+          };
+        }),
+      }),
 
       supportsFiles: true,
       inputSettleMs: 200,

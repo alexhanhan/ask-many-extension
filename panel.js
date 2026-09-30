@@ -9,10 +9,14 @@ const A = globalThis.AskManyAdapters;
 const $ = (s) => document.querySelector(s);
 const el = (t, p = {}) => Object.assign(document.createElement(t), p);
 
-const DIAGNOSTIC_VERSION = 'judge-20260928-3';
+const DIAGNOSTIC_VERSION = 'judge-20260930-1';
+const diagnosticLines = [];
 function logDiagnostic(event, details = {}) {
   // 序列化为当时的快照，避免展开控制台对象时看到后续变更；不传对话正文。
-  console.info(`[同问诊断][${DIAGNOSTIC_VERSION}][${new Date().toISOString()}] ${event} ${JSON.stringify(details)}`);
+  const line = `[同问诊断][${DIAGNOSTIC_VERSION}][${new Date().toISOString()}] ${event} ${JSON.stringify(details)}`;
+  diagnosticLines.push(line);
+  if (diagnosticLines.length > 300) diagnosticLines.shift();
+  console.info(line);
 }
 logDiagnostic('工作台脚本已加载');
 
@@ -234,6 +238,8 @@ function send(siteId, payload, timeoutMs = 200000) {
         textLength: result.text?.length, signature: result.signature,
         baselineSignature: result.answerBaselineSignature,
         baselineCount: result.answerBaselineCount,
+        contentVersion: result.diagnosticVersion || '旧版/未提供',
+        diagnostics: result.diagnostics,
       });
     }
     return result;
@@ -254,6 +260,49 @@ function send(siteId, payload, timeoutMs = 200000) {
     );
   }).then(report);
 }
+
+// 在工作台顶层控制台运行 copy(await askManyDiagnostics())，不需要切换到跨域 iframe。
+globalThis.askManyDiagnostics = async function () {
+  const run = state.currentRun;
+  logDiagnostic('手动诊断：参与设置与本轮快照', {
+    judgeId: state.judgeId,
+    judgeAnswersQuestion: state.judgeAnswersQuestion,
+    judgeIncludedInComparison: state.judgeIncludedInComparison,
+    autoJudge: state.autoJudge, busy: state.busy,
+    enabled: [...state.enabled], frames: [...state.frames.entries()],
+    lockedSites: [...state.lockedSites],
+    run: run ? {
+      judgeId: run.judgeId,
+      judgeAnswersQuestion: run.judgeAnswersQuestion,
+      judgeIncludedInComparison: run.judgeIncludedInComparison,
+      askedIds: run.askedIds, preparedIds: run.preparedIds, firedIds: run.firedIds,
+      waitIds: run.waitIds, plannedComparisonIds: run.plannedComparisonIds,
+      comparisonIds: run.comparisonIds,
+      answerBaselines: run.answerBaselines, answerBaselineCounts: run.answerBaselineCounts,
+      comparisonDispatched: run.comparisonDispatched, dispatchInFlight: run.dispatchInFlight,
+      cachedAnswers: Object.entries(run.answers || {}).map(([id, answer]) => ({
+        id, length: answer.text?.length || 0, signature: answer.signature, isJudge: answer.isJudge,
+      })),
+    } : null,
+  });
+  // 即便裁判被本轮参与规则排除，也检查它当前页面上的回答结构。
+  const ids = [...new Set([...state.enabled, state.judgeId, run?.judgeId])].filter(Boolean);
+  await Promise.all(ids.map(async (id) => {
+    try {
+      const result = await send(id, { type: 'peek' }, 6000);
+      logDiagnostic('手动诊断：页面回答快照', {
+        siteId: id, ok: result.ok, error: result.error,
+        contentVersion: result.diagnosticVersion || '旧版/未提供',
+        versionMatches: result.diagnosticVersion === DIAGNOSTIC_VERSION,
+        length: result.length, signature: result.signature, answerCount: result.answerCount,
+        diagnostics: result.diagnostics,
+      });
+    } catch (error) {
+      logDiagnostic('手动诊断：页面检查异常', { siteId: id, error: error.message });
+    }
+  }));
+  return diagnosticLines.join('\n');
+};
 
 // --------------------------------------------------------------------- 排序与持久化
 async function saveOrder() {
@@ -712,6 +761,12 @@ function syncJudgeParticipationControls() {
 function setJudgeParticipation({ answersQuestion, includedInComparison }) {
   state.judgeAnswersQuestion = Boolean(answersQuestion);
   state.judgeIncludedInComparison = state.judgeAnswersQuestion && Boolean(includedInComparison);
+  logDiagnostic('裁判参与设置已变更', {
+    judgeId: state.judgeId, judgeAnswersQuestion: state.judgeAnswersQuestion,
+    judgeIncludedInComparison: state.judgeIncludedInComparison,
+    runJudgeAnswersQuestion: state.currentRun?.judgeAnswersQuestion,
+    runJudgeIncludedInComparison: state.currentRun?.judgeIncludedInComparison,
+  });
   syncJudgeParticipationControls();
   chrome.storage.local.set({
     [STORE_JUDGE_ASK_KEY]: state.judgeAnswersQuestion,
@@ -1616,7 +1671,13 @@ function isDuelRun(run) {
 function cacheRunAnswers(run, results) {
   if (!run.answers) run.answers = {};
   for (const result of results) {
-    if (!result.ok || !result.text) continue;
+    if (!result.ok || !result.text) {
+      logDiagnostic('回答未进入缓存', {
+        siteId: result.id, ok: result.ok, error: result.error,
+        reason: !result.ok ? '收集指令失败' : '收集结果正文为空',
+      });
+      continue;
+    }
     const adapter = A.byId(result.id);
     run.answers[result.id] = {
       id: result.id,
@@ -1633,6 +1694,19 @@ function cacheRunAnswers(run, results) {
 }
 
 function comparisonEntries(run) {
+  logDiagnostic('对比条目筛选', {
+    judgeId: run.judgeId,
+    judgeAnswersQuestion: run.judgeAnswersQuestion,
+    judgeIncludedInComparison: run.judgeIncludedInComparison,
+    sites: [...new Set([
+      ...(run.askedIds || []), ...(run.waitIds || []), ...run.comparisonIds, run.judgeId,
+    ])].filter(Boolean).map((id) => ({
+      id, cached: Boolean(run.answers?.[id]), length: run.answers?.[id]?.text?.length || 0,
+      included: run.comparisonIds.includes(id) && Boolean(run.answers?.[id]),
+      reason: !run.comparisonIds.includes(id) ? '不在本轮比对名单'
+        : !run.answers?.[id] ? '尚未收集到回答' : '已纳入对比',
+    })),
+  });
   return run.comparisonIds
     .map((id) => run.answers?.[id])
     .filter(Boolean);

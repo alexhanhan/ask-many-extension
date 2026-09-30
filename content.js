@@ -11,7 +11,7 @@
   const site = A.bySite(location.hostname);
   if (!site) return;
 
-  const diagnosticVersion = 'judge-20260928-3';
+  const diagnosticVersion = 'judge-20260930-1';
 
   const answerSignature = (text) => {
     if (!text) return '';
@@ -76,8 +76,19 @@
     type: 'frame-ready', siteId: site.id, inFrame, diagnosticVersion,
   }).catch((error) => console.warn('[同问诊断] 站点注册失败', site.id, error.message));
 
-  chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (!msg || msg.siteId !== site.id) return false;
+    const respond = (result) => {
+      const reply = { ...result, diagnosticVersion };
+      if (msg.type === 'collect') {
+        try {
+          reply.diagnostics = A.answerDiagnostics?.(site, document) ?? null;
+        } catch (error) {
+          reply.diagnostics = { error: error.message };
+        }
+      }
+      sendResponse(reply);
+    };
 
     if (msg.type === 'ping') {
       respond({ ok: true, siteId: site.id, hasInput: !!site.input(document) });
