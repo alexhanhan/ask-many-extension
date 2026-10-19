@@ -1,0 +1,8 @@
+node_modules/
+artifacts/
+*.log
+.env
+.env.*
+!.env.example
+extension/local-settings.json*
+private/
