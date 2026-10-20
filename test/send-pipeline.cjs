@@ -35,7 +35,7 @@ function harness(send, autoSend = true) {
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const prepared = { ok: true, answerBaselineSignature: 'prepared', answerBaselineCount: 1 };
-const baseline = { ok: true, signature: 'fresh', answerCount: 2 };
+const baseline = { ok: true, answerBaselineSignature: 'fresh', answerBaselineCount: 2 };
 
 (async () => {
   const calls = [];
@@ -44,7 +44,8 @@ const baseline = { ok: true, signature: 'fresh', answerCount: 2 };
   const h = harness(async (id, msg) => {
     calls.push(`${id}:${msg.type}`);
     if (msg.type === 'prepare') return id === 'slow' ? slow : prepared;
-    return msg.type === 'peek' ? baseline : { ok: true };
+    assert.notEqual(msg.type, 'peek', 'submission must not wait for an extra peek round trip');
+    return baseline;
   });
   const pending = h.ask();
   await flush();
@@ -58,6 +59,24 @@ const baseline = { ok: true, signature: 'fresh', answerCount: 2 };
   assert.deepEqual(Array.from(h.state.currentRun.firedIds), ['fast', 'slow']);
   assert.equal(h.state.busy, false);
   console.log('PASS slow prepare does not block another site; fresh per-site baseline retained');
+
+  let releaseFire;
+  const slowFire = new Promise((resolve) => { releaseFire = resolve; });
+  const fireCalls = [];
+  const independentFire = harness(async (id, msg) => {
+    fireCalls.push(`${id}:${msg.type}`);
+    if (msg.type === 'prepare') return prepared;
+    if (msg.type === 'peek') throw new Error('unexpected peek');
+    return id === 'slow' ? slowFire : baseline;
+  });
+  const firing = independentFire.ask();
+  await flush();
+  assert(fireCalls.includes('fast:fire'));
+  assert(fireCalls.includes('slow:fire'));
+  assert.equal(independentFire.meta.fast, '已发送', 'slow fire confirmation must not delay fast site');
+  releaseFire(baseline);
+  await firing;
+  console.log('PASS slow fire confirmation does not block another site');
 
   const onlyFill = [];
   const fill = harness(async (id, msg) => {
@@ -84,14 +103,31 @@ const baseline = { ok: true, signature: 'fresh', answerCount: 2 };
 
   const fireFailure = harness(async (id, msg) => {
     if (msg.type === 'prepare') return prepared;
-    if (msg.type === 'peek') return { ok: false, error: 'timeout' };
+    assert.notEqual(msg.type, 'peek');
     return id === 'slow' ? { ok: false, error: 'submit failed' } : { ok: true };
   });
   await fireFailure.ask();
   assert.equal(fireFailure.state.currentRun.answerBaselines.fast, 'prepared');
   assert.deepEqual(Array.from(fireFailure.state.currentRun.firedIds), ['fast']);
   assert.match(fireFailure.meta.slow, /submit failed/);
-  console.log('PASS failed peek preserves prepare baseline; failed fire excluded');
+  console.log('PASS missing fire baseline preserves prepare baseline; failed fire excluded');
+
+  let releasePrepare;
+  const pausedPrepare = new Promise((resolve) => { releasePrepare = resolve; });
+  const cancelledCalls = [];
+  const cancelled = harness(async (id, msg) => {
+    cancelledCalls.push(msg.type);
+    return msg.type === 'prepare' ? pausedPrepare : { ok: true };
+  });
+  const sending = cancelled.ask();
+  await flush();
+  cancelled.state.currentRun = null; // 账号切换取消旧轮次。
+  releasePrepare(prepared);
+  await sending;
+  assert(!cancelledCalls.includes('fire'), 'old prepared text must not submit into a new account');
+  assert.equal(cancelled.elements['#q'].value, 'test question');
+  assert.equal(cancelled.state.busy, false);
+  console.log('PASS account switch cancels pending submission and preserves unsent input');
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

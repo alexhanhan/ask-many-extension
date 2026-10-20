@@ -56,11 +56,11 @@ const context = vm.createContext({
 });
 vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8'), context);
 let peek, collected;
-listener({ type: 'peek', siteId: 'chatgpt' }, {}, (r) => { peek = r; });
+listener({ type: 'peek', siteId: 'chatgpt', diagnostics: true }, {}, (r) => { peek = r; });
 listener({ type: 'collect', siteId: 'chatgpt', immediate: true }, {}, (r) => { collected = r; });
 assert.equal(peek.answerCount, 1);
 assert.equal(peek.length, 3);
-assert.equal(peek.diagnosticVersion, 'judge-20260930-1');
+assert.equal(peek.diagnosticVersion, 'send-20261014-1');
 assert(peek.diagnostics.selectorMatches.some((match) => match.count > 0));
 assert.equal(collected.text, '星期一');
 assert.equal(collected.signature, peek.signature);

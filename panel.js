@@ -9,7 +9,7 @@ const A = globalThis.AskManyAdapters;
 const $ = (s) => document.querySelector(s);
 const el = (t, p = {}) => Object.assign(document.createElement(t), p);
 
-const DIAGNOSTIC_VERSION = 'judge-20260930-1';
+const DIAGNOSTIC_VERSION = 'send-20261014-1';
 const diagnosticLines = [];
 function logDiagnostic(event, details = {}) {
   // 序列化为当时的快照，避免展开控制台对象时看到后续变更；不传对话正文。
@@ -21,6 +21,7 @@ function logDiagnostic(event, details = {}) {
 logDiagnostic('工作台脚本已加载');
 
 const STORE_KEY = 'askmany:enabled';
+const STORE_GEMINI_URL_KEY = 'askmany:gemini_url';
 const STORE_ORDER_KEY = 'askmany:order';
 const STORE_LAYOUT_KEY = 'askmany:layout';
 const STORE_JUDGE_KEY = 'askmany:judge';
@@ -31,6 +32,9 @@ const STORE_SIDEBAR_COLLAPSED_KEY = 'askmany:sidebar_collapsed';
 const STORE_INPUT_HEIGHT_KEY = 'askmany:input_height';
 const STORE_COL_RATIOS_KEY = 'askmany:col_ratios';
 const state = {
+  tabId: null,
+  geminiUrl: null,
+  geminiReloadPending: false,
   enabled: new Set(),
   order: [], // siteId[] 自定义排序数组
   frames: new Map(), // siteId -> {tabId, frameId}
@@ -214,9 +218,38 @@ function renderChips() {
 
 // ------------------------------------------------------------------ frame 发现
 // content script 启动时会发 frame-ready；面板据此知道每个站点落在哪个 frameId。
-chrome.runtime.onMessage.addListener((msg, sender) => {
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  if (msg?.panelTabId === state.tabId && sender.id === chrome.runtime.id && !sender.tab) {
+    if (msg.type === 'gemini-account-opened') {
+      $('#status').textContent = '请在新页签选择 Google 账号；完成后将同步回 Gemini 窗口';
+      return false;
+    }
+    if (msg.type === 'gemini-account-changed') {
+      const frame = document.getElementById('if-gemini');
+      if (!frame) { respond({ ok: false }); return false; }
+      // 账号切换使旧回答基线失效，结束本轮自动裁判监控。
+      activeSynthesisToken++;
+      state.currentRun = null;
+      state.judgePrompt = '';
+      state.judgePromptJudgeId = null;
+      state.lockedSites.delete('gemini');
+      state.geminiUrl = msg.url;
+      state.geminiReloadPending = true;
+      state.frames.delete('gemini');
+      document.getElementById('col-gemini')?.classList.remove('blocked', 'judge-analyzing', 'judge-finished');
+      frame.src = msg.url;
+      setMeta('gemini', '账号已切换，加载中…');
+      $('#status').textContent = 'Gemini 账号已同步，请在页面加载完成后开始新一轮提问';
+      respond({ ok: true });
+      return false;
+    }
+  }
   if (msg?.type === 'frame-ready' && sender.tab && sender.frameId != null) {
     state.frames.set(msg.siteId, { tabId: sender.tab.id, frameId: sender.frameId });
+    if (msg.siteId === 'gemini' && state.geminiReloadPending) {
+      state.geminiReloadPending = false;
+      setMeta('gemini', '账号已切换，已连接');
+    }
     logDiagnostic('站点已连接', {
       siteId: msg.siteId, frameId: sender.frameId,
       contentVersion: msg.diagnosticVersion || '旧版/未提供',
@@ -238,6 +271,7 @@ function send(siteId, payload, timeoutMs = 200000) {
         textLength: result.text?.length, signature: result.signature,
         baselineSignature: result.answerBaselineSignature,
         baselineCount: result.answerBaselineCount,
+        armed: result.armed, timings: result.timings, baselineError: result.baselineError,
         contentVersion: result.diagnosticVersion || '旧版/未提供',
         diagnostics: result.diagnostics,
       });
@@ -289,12 +323,13 @@ globalThis.askManyDiagnostics = async function () {
   const ids = [...new Set([...state.enabled, state.judgeId, run?.judgeId])].filter(Boolean);
   await Promise.all(ids.map(async (id) => {
     try {
-      const result = await send(id, { type: 'peek' }, 6000);
+      const result = await send(id, { type: 'peek', diagnostics: true }, 6000);
       logDiagnostic('手动诊断：页面回答快照', {
         siteId: id, ok: result.ok, error: result.error,
         contentVersion: result.diagnosticVersion || '旧版/未提供',
         versionMatches: result.diagnosticVersion === DIAGNOSTIC_VERSION,
         length: result.length, signature: result.signature, answerCount: result.answerCount,
+        sampleMs: result.sampleMs,
         diagnostics: result.diagnostics,
       });
     } catch (error) {
@@ -1197,6 +1232,27 @@ function makeCol(a) {
   colBtn.onclick = (e) => { e.stopPropagation(); toggleCollapse(a.id); };
 
   actions.append(leftBtn, rightBtn, judgeBtn, maxBtn, colBtn);
+  if (a.accountChooserUrl) {
+    const accountBtn = el('button', {
+      className: 'col-btn account-btn', title: '在新页签切换账号并同步回此窗口',
+      textContent: '切换账号', id: `btn-account-${a.id}`,
+    });
+    accountBtn.onclick = async (event) => {
+      event.stopPropagation();
+      accountBtn.disabled = true;
+      try {
+        const result = await chrome.runtime.sendMessage({
+          type: 'open-gemini-account', panelTabId: state.tabId,
+        });
+        if (!result?.ok) $('#status').textContent = `账号选择页打开失败: ${result?.error || '无响应'}`;
+      } catch (error) {
+        $('#status').textContent = `账号选择页打开失败: ${error.message}`;
+      } finally {
+        accountBtn.disabled = false;
+      }
+    };
+    actions.prepend(accountBtn);
+  }
   h.append(brandDot, nameSpan, judgeBadge, metaSpan, actions);
 
   // 折叠时点击标题栏展开
@@ -1260,7 +1316,7 @@ function makeCol(a) {
 
   // 跨域 iframe 需显式允许写入剪贴板，否则站点的回答/代码块复制会被浏览器拦截。
   const frame = el('iframe', {
-    src: a.url,
+    src: a.accountChooserUrl && state.geminiUrl ? state.geminiUrl : a.url,
     id: `if-${a.id}`,
     allow: 'clipboard-write',
   });
@@ -1398,13 +1454,14 @@ async function ask() {
    */
   const verifyMs = files.length ? 2500 : 0;
 
-  // 各站点独立完成 prepare → 基线 → fire；慢站点不阻塞已就绪的站点。
+  // 各站点独立 prepare → fire；基线在本站点点击提交前读取，不增加消息往返。
   const fired = [];
   const prepared = await Promise.all(
     askTargets.map((id) =>
       send(id, { type: 'prepare', text, files: filesFor(id), armMs: 2500, uploadMs, verifyMs },
            prepareTimeout)
         .then(async (r) => {
+          if (state.currentRun !== run) return { id, ok: false, error: '本轮已结束' };
           const p = { id, ...r };
           if (!p.ok) {
             setMeta(p.id, `失败: ${p.error}`);
@@ -1419,24 +1476,31 @@ async function ask() {
                                     : p.attached ? `${base}（${p.attached} 附件）` : base);
           if (!autoSend) return p;
 
-          // 在本站点提交前刷新基线，避免准备期间旧回答增长影响本轮判定。
-          const baseline = await send(id, { type: 'peek' }, 3000);
-          logDiagnostic('发送前回答基线', {
-            siteId: id, ok: baseline.ok, error: baseline.error,
-            length: baseline.length, signature: baseline.signature, answerCount: baseline.answerCount,
-            contentVersion: baseline.diagnosticVersion || '旧版/未提供', diagnostics: baseline.diagnostics,
-          });
-          if (baseline.ok) {
-            run.answerBaselines[id] = baseline.signature || `length:${baseline.length || 0}`;
-            run.answerBaselineCounts[id] = Number.isFinite(baseline.answerCount)
-              ? baseline.answerCount : null;
-          }
           const result = { id, ...await send(id, { type: 'fire' }, 15000) };
+          if (state.currentRun !== run) return { id, ok: false, error: '本轮已结束' };
+          logDiagnostic('发送前回答基线', {
+            siteId: id, ok: result.ok, error: result.baselineError,
+            length: result.answerBaselineLength, signature: result.answerBaselineSignature,
+            answerCount: result.answerBaselineCount,
+            contentVersion: result.diagnosticVersion || '旧版/未提供',
+          });
+          if (typeof result.answerBaselineSignature === 'string') {
+            run.answerBaselines[id] = result.answerBaselineSignature;
+          }
+          if (Number.isFinite(result.answerBaselineCount)) {
+            run.answerBaselineCounts[id] = result.answerBaselineCount;
+          }
           fired.push(result);
           setMeta(id, result.ok ? '已发送' : `发送失败: ${result.error}`);
           return p;
         }))
   );
+
+  if (state.currentRun !== run) {
+    state.busy = false;
+    $('#go').disabled = false;
+    return;
+  }
 
   const ready = prepared.filter((p) => p.ok).map((p) => p.id);
   run.preparedIds = [...ready];
@@ -1512,15 +1576,11 @@ async function dispatchToJudge(judgeId, prompt, run = null) {
     return { ok: false, error: '裁判正在处理上一轮任务' };
   }
   state.lockedSites.add(judgeId);
-  const releaseJudgeLock = () => state.lockedSites.delete(judgeId);
-
-  // 裁判若参加了首轮，第二轮刚提交时 latestAnswer 仍可能是首轮旧回答。
-  // 记录基线长度，只有检测到新回答后才开始计算“稳定完成”。
-  const baseline = await send(judgeId, { type: 'peek' }, 4000);
-  const baselineLength = baseline.ok ? (baseline.length || 0) : 0;
-  const baselineSignature = baseline.ok
-    ? (baseline.signature || `length:${baselineLength}`)
-    : '';
+  const judgeFrame = state.frames.get(judgeId);
+  const frameChanged = () => state.frames.get(judgeId) !== judgeFrame;
+  const releaseJudgeLock = () => {
+    if (!frameChanged()) state.lockedSites.delete(judgeId);
+  };
 
   setMeta(judgeId, '👑 注入对比提示词…');
   $('#status').textContent = `正在将对比分析任务派发给裁判 [${judgeName}]…`;
@@ -1535,6 +1595,8 @@ async function dispatchToJudge(judgeId, prompt, run = null) {
     verifyMs: 0,
   }, judgeId === 'gemini' ? 120000 : 30000);
 
+  if (frameChanged()) return { ok: false, error: '裁判页面已切换' };
+
   if (!prep.ok) {
     releaseJudgeLock();
     setMeta(judgeId, `👑 派发失败: ${prep.error}`);
@@ -1544,12 +1606,17 @@ async function dispatchToJudge(judgeId, prompt, run = null) {
 
   setMeta(judgeId, '👑 触发裁判作答…');
   const fired = await send(judgeId, { type: 'fire' }, 15000);
+  if (frameChanged()) return { ok: false, error: '裁判页面已切换' };
   if (!fired.ok) {
     releaseJudgeLock();
     setMeta(judgeId, `👑 提交失败: ${fired.error}`);
     $('#status').textContent = `裁判 [${judgeName}] 提交失败: ${fired.error}`;
     return { ok: false, error: fired.error };
   }
+
+  // fire 返回点击提交前的最新基线，避免将首轮旧回答当成裁判的新回复。
+  const baselineLength = fired.answerBaselineLength ?? prep.answerBaselineLength ?? 0;
+  const baselineSignature = fired.answerBaselineSignature ?? prep.answerBaselineSignature ?? `length:${baselineLength}`;
 
   setMeta(judgeId, '👑 裁判生成对比中…');
   judgeCol?.classList.add('judge-analyzing');
@@ -1568,6 +1635,11 @@ async function dispatchToJudge(judgeId, prompt, run = null) {
 
   const judgeTicker = setInterval(async () => {
     if (judgePollInFlight || judgeFinished) return;
+    if (frameChanged()) {
+      judgeFinished = true;
+      clearInterval(judgeTicker);
+      return;
+    }
     judgePollInFlight = true;
     try {
       if (Date.now() - pollStart > maxPoll) {
@@ -1582,6 +1654,7 @@ async function dispatchToJudge(judgeId, prompt, run = null) {
         return;
       }
       const r = await send(judgeId, { type: 'peek' }, 4000);
+      if (frameChanged()) return;
       if (r.ok) {
         const curLen = r.length || 0;
         const curSignature = r.signature || `length:${curLen}`;
@@ -1729,7 +1802,7 @@ async function monitorAndSynthesize(run) {
     setMeta(judgeId, `👑 裁判就位 (等待 ${waitIds.length} 家模型作答…)`);
   }
 
-  const pollInterval = 1200; // 轮询周期缩短至 1.2 秒，大幅提升感知敏捷度
+  const pollInterval = 2000; // 降低流式生成时的 DOM 读取频率
   const maxWaitMs = 150000;
   const startTime = Date.now();
   const lastSignatures = new Map();
@@ -1774,10 +1847,12 @@ async function monitorAndSynthesize(run) {
 
       for (const id of waitIds) {
         const r = await send(id, { type: 'peek' }, 2500);
+        if (token !== activeSynthesisToken || state.currentRun !== run) return;
         const snapshot = {
           siteId: id, ok: r.ok, error: r.error, length: r.length,
           signature: r.signature, answerCount: r.answerCount,
           contentVersion: r.diagnosticVersion || '旧版/未提供', diagnostics: r.diagnostics,
+          sampleMs: r.sampleMs,
         };
         pollSnapshots.push(snapshot);
         if (r.ok) {
@@ -2044,12 +2119,19 @@ async function collect() {
   );
 
   // 轮询各栏字数，让用户看到进度而不是干等。
+  let progressPollInFlight = false;
   const ticker = pendingIds.length ? setInterval(async () => {
-    for (const id of pendingIds) {
-      const r = await send(id, { type: 'peek' }, 4000);
-      if (r.ok) setMeta(id, `${r.length} 字`);
+    if (progressPollInFlight) return;
+    progressPollInFlight = true;
+    try {
+      for (const id of pendingIds) {
+        const r = await send(id, { type: 'peek' }, 4000);
+        if (r.ok) setMeta(id, `${r.length} 字`);
+      }
+    } finally {
+      progressPollInFlight = false;
     }
-  }, 1500) : null;
+  }, 3000) : null;
 
   const results = await Promise.all(
     pendingIds.map((id) =>
@@ -2066,6 +2148,12 @@ async function collect() {
         .then((r) => ({ id, ...r })))
   );
   if (ticker) clearInterval(ticker);
+
+  if (state.currentRun !== run) {
+    state.busy = false;
+    $('#collect').disabled = false;
+    return;
+  }
 
   cacheRunAnswers(run, results);
   const entries = comparisonEntries(run);
@@ -2327,7 +2415,9 @@ function initFooterResize() {
 }
 
 (async () => {
+  state.tabId = (await chrome.tabs.getCurrent())?.id ?? null;
   const saved = await chrome.storage.local.get([
+    STORE_GEMINI_URL_KEY,
     STORE_KEY,
     STORE_ORDER_KEY,
     STORE_LAYOUT_KEY,
@@ -2340,6 +2430,7 @@ function initFooterResize() {
     STORE_COL_RATIOS_KEY,
   ]);
   const ids = saved[STORE_KEY];
+  state.geminiUrl = saved[STORE_GEMINI_URL_KEY] || null;
   state.enabled = new Set(
     Array.isArray(ids) && ids.length ? ids : ['chatgpt', 'deepseek']
   );

@@ -25,9 +25,13 @@
     const candidates = Array.from(doc.querySelectorAll(CHATGPT_ANSWER_SELECTORS.join(', ')))
       .filter((node) => !node.closest(CHATGPT_NON_ANSWER));
     // 兼容新旧结构混用；同一轮可能同时命中外层 assistant 和内层 markdown。
-    const roots = candidates.filter((node) =>
-      !candidates.some((parent) => parent !== node && parent.contains(node))
-    );
+    const candidateSet = new Set(candidates);
+    const roots = candidates.filter((node) => {
+      for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+        if (candidateSet.has(parent)) return false;
+      }
+      return true;
+    });
     const turns = new Set();
     return roots.map((node) => {
       const turn = node.closest('[data-content-search-unit-key$=":assistant"], [data-testid^="conversation-turn-"], article');
@@ -43,9 +47,13 @@
   function chatgptAnswerText(node) {
     const blocks = Array.from(node.querySelectorAll(CHATGPT_ANSWER_BODY))
       .filter((block) => !block.closest(CHATGPT_NON_ANSWER));
-    const outerBlocks = blocks.filter((block) =>
-      !blocks.some((parent) => parent !== block && parent.contains(block))
-    );
+    const blockSet = new Set(blocks);
+    const outerBlocks = blocks.filter((block) => {
+      for (let parent = block.parentElement; parent; parent = parent.parentElement) {
+        if (blockSet.has(parent)) return false;
+      }
+      return true;
+    });
     // 新结构会先出现角色标题，正文节点尚未挂载时不能将标题当成回答。
     if (!outerBlocks.length && node.matches('[data-content-search-unit-key$=":assistant"]') &&
         !node.matches(CHATGPT_ANSWER_BODY)) return '';
@@ -217,6 +225,18 @@
       name: 'Gemini',
       url: 'https://gemini.google.com/app',
       host: /(^|\.)gemini\.google\.com$/,
+      // Google 账号菜单在跨源嵌入窗口中可能不可用，改走独立账号选择页。
+      accountChooserUrl: 'https://accounts.google.com/AccountChooser?continue=https%3A%2F%2Fgemini.google.com%2Fapp',
+      accountEntry: (target) => {
+        const control = target?.closest?.('a, button, [role="button"]');
+        if (!control) return false;
+        const label = control.getAttribute('aria-label') || control.getAttribute('title') || '';
+        if (/Google\s*(Account|账号|帐号|账户|帐户)|switch account|切换(?:账号|帐号|账户|帐户)/i.test(label)) return true;
+        if (control.matches('[data-test-id="account-switcher-button"], [data-testid="account-switcher-button"], .account-switcher-button')) return true;
+        if (control.closest('side-navigation') && control.querySelector('img[src*="googleusercontent.com"]')) return true;
+        const href = control.getAttribute('href') || '';
+        return /^https:\/\/accounts\.google\.com\/(?:SignOutOptions|AccountChooser)(?:[/?#]|$)/i.test(href);
+      },
       input: (d) =>
         d.querySelector('div.ql-editor[contenteditable="true"]') ||
         d.querySelector('rich-textarea div[contenteditable="true"]') ||
@@ -814,7 +834,7 @@
    * 返回 { ok, verified }：ok=false 只表示压根没找到输入框；verified=false
    * 表示填了但读不回来（可能只是读取方式对不上），由调用方决定是否继续。
    */
-  async function fillInputVerified(site, win, doc, text, tries = 4) {
+  async function fillInputVerified(site, win, doc, text, tries = 4, opts = {}) {
     const probe = normText(text).slice(0, 25);
     let foundInput = false;
 
@@ -843,7 +863,13 @@
 
       // 给异步编辑器一次落字机会，再决定是否重填，避免迟到的 paste 造成重复。
       let matched = currentMatch();
-      if (!matched) {
+      if (!matched && opts.readyEarly) {
+        const deadline = Date.now() + 200;
+        while (!matched && Date.now() < deadline) {
+          await sleep(Math.min(20, deadline - Date.now()));
+          matched = currentMatch();
+        }
+      } else if (!matched) {
         await sleep(200);
         matched = currentMatch();
       }
@@ -851,6 +877,19 @@
 
       const settleMs = site.inputSettleMs || 0;
       if (!settleMs) return { ok: true, verified: true };
+
+      // 纯文字无需固定等满稳定窗口：文字已回读且本站点发送键可用就可提交。
+      // 附件可能重建编辑器、按钮状态不可靠的站点仍保留原来的稳定检查。
+      if (opts.readyEarly && !site.sendStateUnreliable && site.submitMode !== 'enter') {
+        const deadline = Date.now() + settleMs;
+        while (currentMatch()) {
+          if (sendable(site.sendBtn(doc))) return { ok: true, verified: true };
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return { ok: true, verified: true };
+          await sleep(Math.min(20, remaining));
+        }
+        continue; // 编辑器被重建，重新确认文字。
+      }
 
       await sleep(settleMs);
       const stable = currentMatch();
@@ -1188,13 +1227,18 @@
     };
   }
 
-  function latestAnswer(site, doc) {
+  // 一次扫描同时取得最新正文和回答数量，避免每次监控重复遍历长对话。
+  function answerSnapshot(site, doc) {
     const nodes = site.answers(doc);
-    if (!nodes || !nodes.length) return null;
+    if (!nodes || !nodes.length) return { text: null, count: 0 };
     const node = nodes[nodes.length - 1];
     // 最新一轮为空时不能回退到旧回答，否则会将上一轮正文交给裁判。
     const text = site.answerText ? site.answerText(node) : (node.innerText || '').trim();
-    return text || null;
+    return { text: text || null, count: nodes.length };
+  }
+
+  function latestAnswer(site, doc) {
+    return answerSnapshot(site, doc).text;
   }
 
   function answerCount(site, doc) {
@@ -1221,8 +1265,8 @@
    * 各站点没有统一的"生成结束"信号，靠 DOM 属性判断每次改版都会失效。
    * 轮询最新回答的文本长度，连续 STABLE_ROUNDS 次不变即认为流式结束 —— 与站点无关。
    */
-  const POLL_MS = 500;
-  const STABLE_ROUNDS = 4; // 连续 2s 无变化
+  const POLL_MS = 1000;
+  const STABLE_ROUNDS = 3; // 连续 3s 无变化，减少流式输出期间的 DOM 读取
   const MAX_WAIT_MS = 180000;
 
   async function waitForStableAnswer(site, doc, onTick, maxWait) {
@@ -1358,7 +1402,7 @@ ${blocks}
     ADAPTERS, bySite, byId,
     fillInput, fillInputVerified, normText, sendable, waitSendable, submit, submitVerified, pressEnter,
     attachFiles, waitForUploads, base64ToFile, countChips, pasteFiles, setFileInput,
-    latestAnswer, answerCount, answerDiagnostics, waitForStableAnswer, buildComparePrompt,
+    answerSnapshot, latestAnswer, answerCount, answerDiagnostics, waitForStableAnswer, buildComparePrompt,
     POLL_MS, STABLE_ROUNDS, MAX_WAIT_MS, sleep,
   };
 })(typeof globalThis !== 'undefined' ? globalThis : self);

@@ -11,7 +11,7 @@
   const site = A.bySite(location.hostname);
   if (!site) return;
 
-  const diagnosticVersion = 'judge-20260930-1';
+  const diagnosticVersion = 'send-20261014-1';
 
   const answerSignature = (text) => {
     if (!text) return '';
@@ -35,9 +35,10 @@
     let stableRounds = 0;
 
     while (Date.now() < deadline) {
-      const text = A.latestAnswer(site, document) || '';
+      const snapshot = A.answerSnapshot(site, document);
+      const text = snapshot.text || '';
       const signature = answerSignature(text);
-      const count = A.answerCount(site, document);
+      const count = snapshot.count;
       if (!started) {
         const hasNewNode = Number.isFinite(baselineAnswerCount) && count > baselineAnswerCount;
         if (!hasNewNode && signature === baselineSignature) {
@@ -66,7 +67,26 @@
   // frameId，导致后续指令被投递到没有输入框的子 frame。
   const inFrame = window.top !== window.self;
   const isDirectChildFrame = inFrame && window.parent === window.top;
+  if (!inFrame && site.accountChooserUrl) {
+    // 后台只处理由工作台发起的账号选择页签；普通独立页签不会影响工作台。
+    chrome.runtime.sendMessage({ type: 'gemini-account-ready' }).catch(() => {});
+  }
   if (!isDirectChildFrame) return;
+
+  if (site.accountEntry) {
+    document.addEventListener('click', (event) => {
+      if (!event.isTrusted || event.button > 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      const target = event.target?.nodeType === 1 ? event.target : event.target?.parentElement;
+      if (!site.accountEntry(target)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      chrome.runtime.sendMessage({ type: 'open-gemini-account' })
+        .then((result) => {
+          if (!result?.ok) console.warn('[同问] 账号选择页打开失败', result?.error);
+        })
+        .catch((error) => console.warn('[同问] 账号选择页打开失败', error.message));
+    }, true);
+  }
 
   // 让面板知道"我在这个 frame 里，可以接指令了"。
   // iframe 内的 content script 无法直接被面板 postMessage 找到（跨源），
@@ -80,7 +100,7 @@
     if (!msg || msg.siteId !== site.id) return false;
     const respond = (result) => {
       const reply = { ...result, diagnosticVersion };
-      if (msg.type === 'collect') {
+      if (msg.diagnostics === true) {
         try {
           reply.diagnostics = A.answerDiagnostics?.(site, document) ?? null;
         } catch (error) {
@@ -102,11 +122,13 @@
      * 面板并发 prepare，本站点就绪后立即 fire，不等其他站点。
      */
     if (msg.type === 'prepare') {
+      const prepareStartedAt = Date.now();
       const files = msg.files || [];
-      const previousAnswer = A.latestAnswer(site, document);
+      const snapshot = A.answerSnapshot(site, document);
+      const previousAnswer = snapshot.text;
       const answerBaselineLength = previousAnswer ? previousAnswer.length : 0;
       const answerBaselineSignature = answerSignature(previousAnswer);
-      const answerBaselineCount = A.answerCount(site, document);
+      const answerBaselineCount = snapshot.count;
 
       /*
        * 先注入附件再填文字：注入后站点立刻开始上传，这段时间正好用来填文字，
@@ -138,7 +160,11 @@
          * Claude 的 ProseMirror 都会），顺序反了刚填的文字会被这次重建吞掉，
          * 最后只发出图片。即便顺序对了也可能撞上重建，所以填完要回读确认。
          */
-        const filled = await A.fillInputVerified(site, window, document, msg.text);
+        const fillStartedAt = Date.now();
+        const filled = await A.fillInputVerified(site, window, document, msg.text, 4, {
+          readyEarly: !files.length,
+        });
+        const fillMs = Date.now() - fillStartedAt;
         if (!filled.ok) {
           return { ok: false, error: filled.error || '文字未能填入', siteId: site.id };
         }
@@ -152,6 +178,7 @@
         const armTimeout = files.length
           ? Math.max(msg.armMs || 2500, msg.uploadMs || 15000)
           : (msg.armMs || 2500);
+        const readyStartedAt = Date.now();
         const [armed, uploaded] = await Promise.all([
           A.waitSendable(site, document, armTimeout),
           shouldWaitUpload
@@ -170,6 +197,7 @@
           answerBaselineLength,
           answerBaselineSignature,
           answerBaselineCount,
+          timings: { fillMs, readyWaitMs: Date.now() - readyStartedAt, prepareMs: Date.now() - prepareStartedAt },
           siteId: site.id,
         };
       })()
@@ -179,27 +207,43 @@
     }
 
     if (msg.type === 'fire') {
+      // 在本站点、点击提交之前同步刷新基线，不再为 peek 额外往返后台和面板。
+      // 基线读取失败不阻止发送，面板可沿用 prepare 的基线。
+      let baseline = {};
+      try {
+        const snapshot = A.answerSnapshot(site, document);
+        baseline = {
+          answerBaselineLength: snapshot.text?.length || 0,
+          answerBaselineSignature: answerSignature(snapshot.text),
+          answerBaselineCount: snapshot.count,
+        };
+      } catch (error) {
+        baseline = { baselineError: error.message };
+      }
+      const respondFired = (result) => respond({ ...result, ...baseline, siteId: site.id });
       if (site.verifySubmit) {
         A.submitVerified(site, window, document, site.submitVerifyMs)
-          .then((r) => respond({ ...r, siteId: site.id }))
-          .catch((e) => respond({ ok: false, error: e.message, siteId: site.id }));
+          .then(respondFired)
+          .catch((e) => respondFired({ ok: false, error: e.message }));
         return true;
       }
       const r = A.submit(site, window, document);
-      respond({ ...r, siteId: site.id });
+      respondFired(r);
       return true;
     }
 
     if (msg.type === 'peek') {
-      const t = A.latestAnswer(site, document);
+      const startedAt = Date.now();
+      const snapshot = A.answerSnapshot(site, document);
+      const t = snapshot.text;
       respond({
         ok: true,
         siteId: site.id,
         length: t ? t.length : 0,
         signature: answerSignature(t),
-        answerCount: A.answerCount(site, document),
+        answerCount: snapshot.count,
+        sampleMs: Date.now() - startedAt,
         diagnosticVersion,
-        diagnostics: A.answerDiagnostics?.(site, document) ?? null,
       });
       return true;
     }
