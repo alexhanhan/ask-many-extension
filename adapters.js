@@ -62,25 +62,162 @@
       : (node.innerText || '').trim();
   }
 
+  function chatgptInput(doc, scope = doc) {
+    const editable = (node) => usableControl(node) && node.isConnected !== false &&
+      !node.disabled && !node.readOnly &&
+      (node.tagName === 'TEXTAREA' || node.getAttribute('contenteditable') === 'true');
+    // SPA 切换会话时可能短暂保留旧编辑器，重复的 id 不能用 querySelector 取第一个。
+    let candidates = Array.from(scope.querySelectorAll('#prompt-textarea')).filter(editable);
+    if (!candidates.length) candidates = Array.from(scope.querySelectorAll(
+      'main form [contenteditable="true"], main [data-type="unified-composer"] [contenteditable="true"], ' +
+      'main [data-testid="composer"] [contenteditable="true"]'
+    )).filter(editable);
+    // 多个可见编辑器无法确定目标时不猜测，避免把追问送进另一个聊天。
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  function chatgptComposer(doc, input = chatgptInput(doc)) {
+    return input?.closest('form, [data-type="unified-composer"], [data-testid="composer"]') ||
+      input?.parentElement?.parentElement || null;
+  }
+
+  function usableControl(node) {
+    if (!node || node.closest('[hidden], [aria-hidden="true"], [inert]') ||
+        (typeof node.getClientRects === 'function' && !node.getClientRects().length)) return false;
+    const style = node.ownerDocument?.defaultView?.getComputedStyle?.(node);
+    return !style || (style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse');
+  }
+
+  function chatgptGenerating(doc, input = chatgptInput(doc)) {
+    const scope = chatgptComposer(doc, input);
+    if (!scope) return false;
+    return Array.from(scope.querySelectorAll(
+      'button[data-testid="stop-button"], button[aria-label*="Stop generating" i], ' +
+      'button[aria-label*="Stop streaming" i], button[aria-label*="停止生成"], ' +
+      'button[aria-label*="停止"]'
+    )).some(usableControl);
+  }
+
+  function chatgptSendButton(doc, input = chatgptInput(doc)) {
+    const composer = chatgptComposer(doc, input);
+    if (!composer) return null;
+    const controls = (scope) => Array.from(scope.querySelectorAll(
+      'button[data-testid="send-button"], button#composer-submit-button, ' +
+      'button[data-testid="composer-submit-button"], button[aria-label], button[title]'
+    )).filter((button) => {
+      if (!usableControl(button)) return false;
+      const label = `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''}`.trim();
+      if (/stop|停止|取消生成|voice|语音|語音|dictat|听写|聽寫/i.test(label) ||
+          button.getAttribute('data-testid') === 'stop-button') return false;
+      return button.id === 'composer-submit-button' ||
+        ['send-button', 'composer-submit-button'].includes(button.getAttribute('data-testid')) ||
+        [button.getAttribute('aria-label'), button.getAttribute('title')].some((value) =>
+          /^(?:send(?:\s+(?:prompt|message))?|发送(?:提示|消息|信息)?|發送(?:提示|訊息)?|傳送(?:提示|訊息)?|提交(?:提示|消息)?)(?:\s*[（(][^）)]*[）)])?$/i.test((value || '').trim()));
+    });
+    const candidates = controls(composer);
+    return candidates.find(sendable) || candidates[0] || null;
+  }
+
+  function chatgptEnterReady(doc, input = chatgptInput(doc)) {
+    const composer = chatgptComposer(doc, input);
+    return Boolean(input && composer && inputText(input).trim() &&
+      !chatgptSendButton(doc, input) && !chatgptGenerating(doc, input) &&
+      !composer?.querySelector('[aria-busy="true"], [role="progressbar"]'));
+  }
+
+  function chatgptFileInput(doc, input = chatgptInput(doc)) {
+    const composer = chatgptComposer(doc, input);
+    if (!composer) return null;
+    const local = composer.querySelector('input[type="file"][multiple], input[type="file"]');
+    if (local) return local;
+    // 部分版本把隐藏 file input 放在 form 外；只接受当前 main 中唯一且不属于其他输入区域的节点。
+    const scope = input.closest('main') || composer;
+    const candidates = Array.from(scope.querySelectorAll('input[type="file"]')).filter((node) =>
+      !node.closest('form, [data-type="unified-composer"], [data-testid="composer"]') &&
+      !node.parentElement?.closest('[hidden], [aria-hidden="true"], [inert]'));
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  function chatgptUploadedChips(doc, input = chatgptInput(doc)) {
+    const composer = chatgptComposer(doc, input);
+    return composer ? composer.querySelectorAll(
+      'button[aria-label*="Remove" i], button[aria-label*="删除" i], button[aria-label*="Delete" i], ' +
+      '[data-testid*="file" i], [data-testid*="attachment" i], [data-testid*="upload" i], ' +
+      '[class*="attachment"], [class*="file-preview"], [class*="file-item"], [class*="fileItem"], ' +
+      '[class*="file-pill"], [class*="file-card"], [role="progressbar"], ' +
+      'img[src^="blob:"], img[src^="data:"], img[alt]:not([alt=""])'
+    ) : [];
+  }
+
+  function chatgptSendContext(doc, location) {
+    const route = () => `${location.hostname}${location.pathname || '/'}`;
+    const originalRoute = route();
+    const newConversationPrefix = `${originalRoute.replace(/\/$/, '')}/c/`;
+    let submitted = false;
+    let input = chatgptInput(doc);
+    let composer = chatgptComposer(doc, input);
+    const currentInput = () => {
+      const currentRoute = route();
+      // 首页首次提交后会获得 /c/id；这次站内跳转是提交结果，可以继续确认。
+      const createdConversation = submitted && !originalRoute.includes('/c/') &&
+        currentRoute.startsWith(newConversationPrefix);
+      if (currentRoute !== originalRoute && !createdConversation) {
+        throw new Error('ChatGPT 会话已切换，请在目标会话重新发送');
+      }
+      if (input && input.isConnected !== false) {
+        if (!usableControl(input) || chatgptInput(doc) !== input) {
+          throw new Error('ChatGPT 输入区域已切换，请在目标会话重新发送');
+        }
+        return input;
+      }
+      // 附件可能重建编辑器，允许同一会话内替换节点；不跨越仍存在的原输入区域。
+      input = chatgptInput(doc, composer?.isConnected ? composer : doc);
+      if (input) composer = chatgptComposer(doc, input);
+      return input;
+    };
+    return { ...this,
+      didSubmit: () => { submitted = true; },
+      assertSendContext: currentInput,
+      input: currentInput,
+      sendBtn: () => chatgptSendButton(doc, currentInput()),
+      isGenerating: () => chatgptGenerating(doc, currentInput()),
+      canSubmitWithEnter: () => chatgptEnterReady(doc, currentInput()),
+      fileInput: () => chatgptFileInput(doc, currentInput()),
+      uploadedChips: () => chatgptUploadedChips(doc, currentInput()),
+    };
+  }
+
   const ADAPTERS = [
     {
       id: 'chatgpt',
       name: 'ChatGPT',
       url: 'https://chatgpt.com/?model=auto',
       host: /(^|\.)(chatgpt\.com|chat\.openai\.com)$/,
-      input: (d) =>
-        d.querySelector('div#prompt-textarea[contenteditable="true"]') ||
-        d.querySelector('#prompt-textarea') ||
-        d.querySelector('main div[contenteditable="true"]'),
-      sendBtn: (d) =>
-        d.querySelector('button[data-testid="send-button"]') ||
-        d.querySelector('button[aria-label*="Send" i]'),
+      input: chatgptInput,
+      createSendContext: chatgptSendContext,
+      sendBtn: chatgptSendButton,
+      isGenerating: chatgptGenerating,
+      canSubmitWithEnter: chatgptEnterReady,
+      verifySubmit: true,
+      retrySubmit: false, // 只触发一次，随后确认，避免等待服务端期间重复发送。
+      submitVerifyMs: 3500,
       answers: chatgptAnswers,
       answerText: chatgptAnswerText,
       answerDiagnostics: (d) => ({
+        composer: { candidates: d.querySelectorAll('#prompt-textarea').length,
+          visibleCandidates: Array.from(d.querySelectorAll('#prompt-textarea')).filter(usableControl).length,
+          inputMatched: Boolean(chatgptInput(d)) },
         selectorMatches: CHATGPT_ANSWER_SELECTORS.map((selector) => ({
           selector, count: d.querySelectorAll(selector).length,
         })),
+        sendControl: (() => {
+          const button = chatgptSendButton(d);
+          return { matched: Boolean(button), id: button?.id || null,
+            testId: button?.getAttribute('data-testid') || null,
+            hasSendLabel: /^(?:send|发送|發送|傳送|提交)/i.test(button?.getAttribute('aria-label') || ''),
+            sendable: sendable(button), generating: chatgptGenerating(d),
+            enterReady: chatgptEnterReady(d) };
+        })(),
       }),
       inputSettleMs: 150,
 
@@ -88,34 +225,8 @@
       // 优先走 paste 贴图路径，若未成功再回退 input / drop。
       supportsFiles: true,
       fileRoutes: ['paste', 'input', 'drop'],
-      fileInput: (d) => {
-        const composer =
-          d.querySelector('#prompt-textarea')?.closest('form') ||
-          d.querySelector('#prompt-textarea')?.closest('div[class*="composer"]') ||
-          d.querySelector('#prompt-textarea')?.parentElement?.parentElement?.parentElement ||
-          d.querySelector('main') || d;
-        return (
-          composer.querySelector('input[type="file"][multiple]') ||
-          composer.querySelector('input[type="file"]') ||
-          d.querySelector('input[type="file"][multiple]') ||
-          d.querySelector('input[type="file"]')
-        );
-      },
-      uploadedChips: (d) => {
-        const composer =
-          d.querySelector('#prompt-textarea')?.closest('form') ||
-          d.querySelector('#prompt-textarea')?.closest('div[class*="composer"]') ||
-          d.querySelector('#prompt-textarea')?.parentElement?.parentElement?.parentElement ||
-          d.querySelector('main') ||
-          d;
-        return composer.querySelectorAll(
-          'button[aria-label*="Remove" i], button[aria-label*="删除" i], button[aria-label*="Delete" i], ' +
-          '[data-testid*="file" i], [data-testid*="attachment" i], [data-testid*="upload" i], ' +
-          '[class*="attachment"], [class*="file-preview"], [class*="file-item"], [class*="fileItem"], ' +
-          '[class*="file-pill"], [class*="file-card"], [role="progressbar"], ' +
-          'img[src^="blob:"], img[src^="data:"], img[alt]:not([alt=""])'
-        );
-      },
+      fileInput: chatgptFileInput,
+      uploadedChips: chatgptUploadedChips,
     },
     {
       id: 'deepseek',
@@ -758,19 +869,17 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ProseMirror / Quill / Lexical 用合成 paste 最稳；改 innerHTML 会让编辑器内部状态脱节。
-  async function setContentEditable(win, doc, el, text) {
-    el.focus();
-
+  async function setContentEditable(win, doc, el, text, assertContext) {
     const selectContents = () => {
-      try {
-        doc.execCommand('selectAll', false, null);
-      } catch {
-        const sel = win.getSelection();
-        sel.removeAllRanges();
-        const range = doc.createRange();
-        range.selectNodeContents(el);
-        sel.addRange(range);
-      }
+      assertContext?.();
+      if (el.isConnected === false) throw new Error('输入框已更新，请重试');
+      el.focus();
+      // 明确圈定目标编辑器，不能依赖可能停留在旧输入框里的全页 selectAll。
+      const sel = win.getSelection();
+      const range = doc.createRange();
+      range.selectNodeContents(el);
+      sel.removeAllRanges();
+      sel.addRange(range);
     };
     selectContents();
 
@@ -820,7 +929,7 @@
     const el = site.input(doc);
     if (!el) return false;
     if (el.tagName === 'TEXTAREA') setTextareaValue(win, el, text);
-    else await setContentEditable(win, doc, el, text);
+    else await setContentEditable(win, doc, el, text, site.assertSendContext);
     return true;
   }
 
@@ -883,7 +992,10 @@
       if (opts.readyEarly && !site.sendStateUnreliable && site.submitMode !== 'enter') {
         const deadline = Date.now() + settleMs;
         while (currentMatch()) {
-          if (sendable(site.sendBtn(doc))) return { ok: true, verified: true };
+          const button = site.sendBtn(doc);
+          if (sendable(button) || (!button && site.canSubmitWithEnter?.(doc))) {
+            return { ok: true, verified: true };
+          }
           const remaining = deadline - Date.now();
           if (remaining <= 0) return { ok: true, verified: true };
           await sleep(Math.min(20, remaining));
@@ -1096,9 +1208,14 @@
     if (!btn) return false;
     const ariaDisabled = btn.getAttribute('aria-disabled');
     const disabled = btn.disabled;
-    if (ariaDisabled === 'true' || disabled) return false;
+    const dataDisabled = btn.getAttribute('data-disabled');
+    if (ariaDisabled === 'true' || disabled || btn.hasAttribute?.('disabled') ||
+        dataDisabled === '' || dataDisabled === 'true') return false;
     const cls = String(btn.className || '');
-    if (cls.includes('disabled') || cls.includes('sendNot')) return false;
+    // disabled:opacity-50 等是 Tailwind 状态样式，并不表示按钮当前被禁用。
+    // 仅识别独立的状态类，保留其他站点的 is-disabled / ant-btn-disabled 等约定。
+    if (cls.split(/\s+/).some((token) => /^[\w-]+$/.test(token) &&
+        (/(?:^|[-_])disabled(?:$|[-_])/i.test(token) || token.includes('sendNot')))) return false;
     return true;
   }
 
@@ -1132,17 +1249,19 @@
    * submitMode:'enter' 不依赖按钮，sendStateUnreliable 的站点读不出按钮状态
    * （aria-disabled 和 disabled 都是空），等下去只会白等满 maxMs，都直接放行。
    */
-  async function waitSendable(site, doc, maxMs = 2500) {
+  async function waitSendable(site, doc, maxMs = 2500, opts = {}) {
     if (site.submitMode === 'enter' || site.sendStateUnreliable) return true;
     const deadline = Date.now() + maxMs;
     while (Date.now() < deadline) {
-      if (sendable(site.sendBtn(doc))) return true;
+      const button = site.sendBtn(doc);
+      if (sendable(button) || (!button && opts.allowEnterFallback && site.canSubmitWithEnter?.(doc))) return true;
       await sleep(60);
     }
     return false; // 按钮始终不可用，submit 时回退到回车
   }
 
   function submit(site, win, doc) {
+    if (site.isGenerating?.(doc)) return { ok: false, error: '模型仍在生成上一条回答' };
     // 对于使用enter模式的站点，优先回车，失败时尝试按钮
     if (site.submitMode === 'enter') {
       if (pressEnter(site, win, doc)) {
@@ -1167,6 +1286,9 @@
     }
 
     // 按钮不可用，尝试回车
+    if (site.canSubmitWithEnter && !site.canSubmitWithEnter(doc)) {
+      return { ok: false, error: '本站点发送按钮尚不可用，请稍后重试' };
+    }
     return pressEnter(site, win, doc)
       ? { ok: true, via: 'enter' }
       : { ok: false, error: '既无可用按钮也无输入框' };
@@ -1191,6 +1313,21 @@
     };
 
     const deadline = Date.now() + maxMs;
+    if (site.retrySubmit === false) {
+      const result = submit(site, win, doc);
+      if (!result.ok) return { ...result, attempts: 0 };
+      site.didSubmit?.();
+      do {
+        const current = site.input(doc);
+        if ((current && completed()) || site.isGenerating?.(doc)) {
+          return { ...result, verified: true, attempts: 1 };
+        }
+        if (Date.now() >= deadline) break;
+        await sleep(Math.min(50, deadline - Date.now()));
+      } while (true);
+      return { ok: false, error: '未确认提交成功，文字仍保留在本站点输入框', via: result.via,
+        verified: false, attempts: 1 };
+    }
     let attempts = 0;
     let last = null;
 

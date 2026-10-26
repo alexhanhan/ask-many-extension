@@ -79,7 +79,7 @@ const panelState = {
 let panelListener;
 const panelContext = vm.createContext({
   A, state: panelState, document: panelDocument, SITE_THEMES: {},
-  DIAGNOSTIC_VERSION: 'send-20261014-1',
+  DIAGNOSTIC_VERSION: 'send-20261020-2',
   activeSynthesisToken: 0, logDiagnostic() {}, paintDots() {}, setTimeout() {},
   $: (selector) => panelDocument.querySelector(selector),
   el: (tag, props = {}) => {
@@ -138,10 +138,20 @@ function request(msg, sender) {
   assert.equal(panelState.lockedSites.has('gemini'), false);
   assert.equal(panelState.judgePrompt, '');
   assert.equal(panelContext.activeSynthesisToken, 1);
-  panelListener({ type: 'frame-ready', siteId: 'gemini' }, { tab: { id: 10 }, frameId: 5 });
+  panelListener({ type: 'frame-ready', siteId: 'gemini', inFrame: true }, { tab: { id: 10 }, frameId: 5 });
   assert.equal(panelState.frames.get('gemini').frameId, 5);
   assert.equal(panelState.geminiReloadPending, false);
   assert.equal(panelDocument.getElementById('meta-gemini').textContent, '账号已切换，已连接');
+  panelListener({ type: 'frame-ready', siteId: 'gemini', inFrame: true }, { tab: { id: 99 }, frameId: 8 });
+  panelListener({ type: 'frame-ready', siteId: 'gemini', inFrame: false }, { tab: { id: 10 }, frameId: 0 });
+  panelListener({ type: 'frame-ready', siteId: 'unknown', inFrame: true }, { tab: { id: 10 }, frameId: 7 });
+  assert.equal(panelState.frames.get('gemini').frameId, 5, 'another workbench tab must not overwrite this tab frame');
+  assert.equal(panelState.frames.has('unknown'), false);
+  panelListener({ type: 'frame-ready', siteId: 'chatgpt', inFrame: true }, { tab: { id: 10 }, frameId: 6 });
+  panelListener({ type: 'frame-ready', siteId: 'chatgpt', inFrame: true }, { tab: { id: 99 }, frameId: 9 });
+  assert.equal(panelState.frames.get('chatgpt').tabId, 10);
+  assert.equal(panelState.frames.get('chatgpt').frameId, 6);
+  console.log('PASS frame registration stays within its own workbench tab');
   const normalize = ctx.geminiAccountUrl;
   assert.equal(normalize('https://gemini.google.com/app?authuser=3&foo=private'), 'https://gemini.google.com/app?authuser=3');
   assert.equal(normalize('https://gemini.google.com.evil.example/u/3/app'), null);

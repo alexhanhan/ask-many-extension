@@ -23,7 +23,7 @@ const context = vm.createContext({
   },
   send: async (id, payload) => {
     calls.push([id, payload.type]);
-    return { ok: true, length: 20, answerCount: 1, diagnosticVersion: 'send-20261014-1', text: secret };
+    return { ok: true, length: 20, answerCount: 1, diagnosticVersion: 'send-20261020-2', text: secret };
   },
 });
 vm.runInContext(panel.slice(panel.indexOf('const DIAGNOSTIC_VERSION'), panel.indexOf('const STORE_KEY')), context);
@@ -37,7 +37,7 @@ vm.runInContext(panel.slice(panel.indexOf('function comparisonEntries('), panel.
   assert.equal(typeof exported, 'string');
   assert(!exported.includes(secret), 'diagnostics must not contain question/answer/prompt bodies');
   assert(exported.includes('不在本轮比对名单'));
-  assert(exported.includes('send-20261014-1'));
+  assert(exported.includes('send-20261020-2'));
   assert.deepEqual(calls, [['chatgpt', 'peek'], ['gemini', 'peek']]);
   console.log('PASS export includes excluded judge, selection reasons and version, without bodies');
 
@@ -65,7 +65,7 @@ vm.runInContext(panel.slice(panel.indexOf('function comparisonEntries('), panel.
   for (const type of ['peek', 'collect']) {
     let reply;
     listener({ siteId: 'gemini', type, immediate: true, diagnostics: true }, {}, (result) => { reply = result; });
-    assert.equal(reply.diagnosticVersion, 'send-20261014-1');
+    assert.equal(reply.diagnosticVersion, 'send-20261020-2');
     assert.equal(reply.diagnostics.nodeCount, 1);
     if (type === 'peek') assert(!JSON.stringify(reply).includes(secret));
     else assert.equal(reply.text, secret, 'collection still returns original answer');

@@ -1574,7 +1574,7 @@
       </svg>
     </div>
     <div class="brand-text">
-      <div class="brand-name">同问 <span class="highlight">AI</span> <span class="version-tag">v1.2.6</span></div>
+      <div class="brand-name">同问 <span class="highlight">AI</span> <span class="version-tag">v1.2.8</span></div>
       <div class="brand-subtitle">多模型并排提问工作台</div>
     </div>
     <button class="sidebar-collapse-btn" id="btnCollapseSidebar" title="收起侧边栏 (Ctrl+B)">
@@ -1667,7 +1667,7 @@
       </div>
       <div class="action-btns">
         <button id="go" class="primary">
-          <span>发送</span>
+          <span id="goLabel">发送</span>
           <kbd class="key-hint">↵</kbd>
         </button>
         <button id="collect" class="secondary" title="收集所有已完成模型的回答并生成综合对比">
@@ -1696,7 +1696,7 @@
       </div>
 
       <span class="status-divider"></span>
-      <span id="status"></span>
+      <span id="status" role="status" aria-live="polite"></span>
     </div>
   </footer>
 </div>
@@ -1766,7 +1766,7 @@
   </div>
 </dialog>
 
-<script src="adapters.js?v=1.2.6"></script>
-<script src="panel.js?v=1.2.6"></script>
+<script src="adapters.js?v=1.2.8"></script>
+<script src="panel.js?v=1.2.8"></script>
 </body>
 </html>

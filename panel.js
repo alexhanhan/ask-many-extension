@@ -9,7 +9,7 @@ const A = globalThis.AskManyAdapters;
 const $ = (s) => document.querySelector(s);
 const el = (t, p = {}) => Object.assign(document.createElement(t), p);
 
-const DIAGNOSTIC_VERSION = 'send-20261014-1';
+const DIAGNOSTIC_VERSION = 'send-20261020-2';
 const diagnosticLines = [];
 function logDiagnostic(event, details = {}) {
   // 序列化为当时的快照，避免展开控制台对象时看到后续变更；不传对话正文。
@@ -181,11 +181,12 @@ function removeAttachment(i) {
   renderChips();
 }
 
-function clearAttachments() {
-  for (const a of state.attachments) if (a.url) URL.revokeObjectURL(a.url);
-  state.attachments = [];
+function clearAttachments(consumed = state.attachments) {
+  const sent = new Set(consumed);
+  for (const a of state.attachments) if (sent.has(a) && a.url) URL.revokeObjectURL(a.url);
+  state.attachments = state.attachments.filter((a) => !sent.has(a));
   renderChips();
-  $('#fileHint').textContent = '';
+  if (!state.attachments.length) $('#fileHint').textContent = '';
 }
 
 function renderChips() {
@@ -219,6 +220,15 @@ function renderChips() {
 // ------------------------------------------------------------------ frame 发现
 // content script 启动时会发 frame-ready；面板据此知道每个站点落在哪个 frameId。
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  if (msg?.type === 'site-send-progress') {
+    const run = state.currentRun;
+    const frame = state.frames.get(msg.siteId);
+    if (run && run.dispatchToken === msg.dispatchToken && msg.stage === 'filled' &&
+        sender.tab?.id === state.tabId && frame?.frameId === sender.frameId) {
+      run.onFilled?.(msg.siteId);
+    }
+    return false;
+  }
   if (msg?.panelTabId === state.tabId && sender.id === chrome.runtime.id && !sender.tab) {
     if (msg.type === 'gemini-account-opened') {
       $('#status').textContent = '请在新页签选择 Google 账号；完成后将同步回 Gemini 窗口';
@@ -244,7 +254,8 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       return false;
     }
   }
-  if (msg?.type === 'frame-ready' && sender.tab && sender.frameId != null) {
+  if (msg?.type === 'frame-ready' && sender.tab?.id === state.tabId &&
+      sender.frameId > 0 && msg.inFrame === true && A.byId(msg.siteId)) {
     state.frames.set(msg.siteId, { tabId: sender.tab.id, frameId: sender.frameId });
     if (msg.siteId === 'gemini' && state.geminiReloadPending) {
       state.geminiReloadPending = false;
@@ -272,6 +283,7 @@ function send(siteId, payload, timeoutMs = 200000) {
         baselineSignature: result.answerBaselineSignature,
         baselineCount: result.answerBaselineCount,
         armed: result.armed, timings: result.timings, baselineError: result.baselineError,
+        via: result.via, verified: result.verified, attempts: result.attempts,
         contentVersion: result.diagnosticVersion || '旧版/未提供',
         diagnostics: result.diagnostics,
       });
@@ -1349,8 +1361,9 @@ let lastQuestion = '';
 let activeSynthesisToken = 0;
 
 async function ask() {
-  const text = $('#q').value.replace(/\r\n/g, '\n').trim();
-  const files = state.attachments;
+  const draftValue = $('#q').value;
+  const text = draftValue.replace(/\r\n/g, '\n').trim();
+  const files = [...state.attachments];
   // 只有附件没有文字也允许发（发图问"这是什么"是常见用法）
   if ((!text && !files.length) || state.busy) return;
   const targets = state.order.filter((id) => state.enabled.has(id));
@@ -1382,6 +1395,7 @@ async function ask() {
   }
 
   const run = {
+    dispatchToken: activeSynthesisToken,
     question: text,
     judgeId,
     judgeAnswersQuestion,
@@ -1435,6 +1449,38 @@ async function ask() {
   }
 
   const autoSend = $('#autosend').checked;
+  const stages = new Map(askTargets.map((id) => [id, files.length ? '上传/填入中' : '填入中']));
+  let draftConsumed = false;
+  const consumeSubmittedDraft = () => {
+    if (draftConsumed) return;
+    draftConsumed = true;
+    const q = $('#q');
+    if (q.value === draftValue) {
+      q.value = '';
+      q.focus();
+    }
+    if (files.length) clearAttachments(files);
+  };
+  const updateDispatchProgress = () => {
+    if (state.currentRun !== run) return;
+    const sentCount = [...stages.values()].filter((stage) => stage === 'submitted').length;
+    const failedCount = [...stages.values()].filter((stage) => stage === 'failed').length;
+    const filledCount = [...stages.values()].filter((stage) => stage === 'filled').length;
+    const waiting = [...stages].filter(([, stage]) => !['submitted', 'failed', 'filled'].includes(stage));
+    const waitingText = waiting.map(([id, stage]) => `${A.byId(id)?.name || id}：${stage}`).join('；');
+    $('#status').textContent = (autoSend ? `${sentCount}/${askTargets.length} 已提交` : `${filledCount}/${askTargets.length} 已填入`) +
+      (failedCount ? `，${failedCount} 家失败` : '') +
+      (waitingText ? `；${waitingText}` : autoSend ? '，等待模型回答' : '（未自动发送）');
+    const label = $('#goLabel');
+    if (label && autoSend) label.textContent = `提交 ${sentCount}/${askTargets.length}`;
+  };
+  run.onFilled = (id) => {
+    if (!['填入中', '上传/填入中'].includes(stages.get(id))) return;
+    stages.set(id, '已填入，等待本站点就绪');
+    setMeta(id, '已填入，等待本站点就绪');
+    updateDispatchProgress();
+  };
+  if (autoSend) updateDispatchProgress();
 
   // 附件只发给支持的站点；不支持的照常发文字，避免整条消息卡住
   const payloadFiles = files.map(({ name, type, data }) => ({ name, type, data }));
@@ -1458,25 +1504,31 @@ async function ask() {
   const fired = [];
   const prepared = await Promise.all(
     askTargets.map((id) =>
-      send(id, { type: 'prepare', text, files: filesFor(id), armMs: 2500, uploadMs, verifyMs },
+      send(id, { type: 'prepare', dispatchToken: run.dispatchToken,
+        text, files: filesFor(id), armMs: 2500, uploadMs, verifyMs },
            prepareTimeout)
         .then(async (r) => {
           if (state.currentRun !== run) return { id, ok: false, error: '本轮已结束' };
           const p = { id, ...r };
           if (!p.ok) {
             setMeta(p.id, `失败: ${p.error}`);
+            stages.set(id, 'failed');
+            updateDispatchProgress();
             return p;
           }
 
           run.answerBaselines[id] = p.answerBaselineSignature ?? null;
+          run.preparedIds.push(id);
           run.answerBaselineCounts[id] = Number.isFinite(p.answerBaselineCount)
             ? p.answerBaselineCount : null;
-          const base = autoSend ? '发送中' : '已填入';
+          stages.set(id, autoSend ? '已填入，确认提交中' : 'filled');
+          updateDispatchProgress();
+          const base = autoSend ? '已填入，确认提交中' : '已填入';
           setMeta(id, p.fileError ? `${base}（附件: ${p.fileError}）`
                                     : p.attached ? `${base}（${p.attached} 附件）` : base);
           if (!autoSend) return p;
 
-          const result = { id, ...await send(id, { type: 'fire' }, 15000) };
+          const result = { id, ...await send(id, { type: 'fire', preparationId: p.preparationId }, 15000) };
           if (state.currentRun !== run) return { id, ok: false, error: '本轮已结束' };
           logDiagnostic('发送前回答基线', {
             siteId: id, ok: result.ok, error: result.baselineError,
@@ -1491,7 +1543,11 @@ async function ask() {
             run.answerBaselineCounts[id] = result.answerBaselineCount;
           }
           fired.push(result);
-          setMeta(id, result.ok ? '已发送' : `发送失败: ${result.error}`);
+          run.firedIds = fired.filter((entry) => entry.ok).map((entry) => entry.id);
+          stages.set(id, result.ok ? 'submitted' : 'failed');
+          if (result.ok) consumeSubmittedDraft();
+          setMeta(id, result.ok ? '已提交，等待回答' : `提交失败: ${result.error}`);
+          updateDispatchProgress();
           return p;
         }))
   );
@@ -1499,6 +1555,7 @@ async function ask() {
   if (state.currentRun !== run) {
     state.busy = false;
     $('#go').disabled = false;
+    if ($('#goLabel')) $('#goLabel').textContent = '发送';
     return;
   }
 
@@ -1513,6 +1570,7 @@ async function ask() {
     $('#status').textContent = `${ready.length}/${askTargets.length} 已填入（未自动发送，请在各栏手动发）`;
     state.busy = false;
     $('#go').disabled = false;
+    if ($('#goLabel')) $('#goLabel').textContent = '发送';
     return;
   }
 
@@ -1524,16 +1582,12 @@ async function ask() {
     (id) => id !== judgeId || judgeIncludedInComparison
   );
   const good = sentIds.length;
-  const failed = prepared.filter((p) => !p.ok).length;
+  const failed = askTargets.length - good;
   $('#status').textContent =
-    `${good}/${askTargets.length} 已发送` + (failed ? `，${failed} 个填入失败` : '') + judgeSuffix;
+    `${good}/${askTargets.length} 已提交` + (failed ? `，${failed} 家失败` : '，等待模型回答') + judgeSuffix;
 
-  // 发送成功后清空输入框和附件，并重新聚焦（fillInput 会让 iframe 获得焦点）
+  // 输入已由第一家提交成功时消费；本轮结束不能覆盖用户正在编辑的下一条草稿。
   if (good > 0) {
-    const q = $('#q');
-    q.value = '';
-    clearAttachments();
-    q.focus();
 
     // 如果开启了裁判与自动派发，启动后台监控并在作答完毕后自动派发给裁判
     const hasNonJudgeAnswer = run.comparisonIds.some((id) => id !== judgeId);
@@ -1553,6 +1607,7 @@ async function ask() {
 
   state.busy = false;
   $('#go').disabled = false;
+  if ($('#goLabel')) $('#goLabel').textContent = '发送';
 }
 
 // --------------------------------------------------------------------- 裁判派发与监控
@@ -1605,7 +1660,7 @@ async function dispatchToJudge(judgeId, prompt, run = null) {
   }
 
   setMeta(judgeId, '👑 触发裁判作答…');
-  const fired = await send(judgeId, { type: 'fire' }, 15000);
+  const fired = await send(judgeId, { type: 'fire', preparationId: prep.preparationId }, 15000);
   if (frameChanged()) return { ok: false, error: '裁判页面已切换' };
   if (!fired.ok) {
     releaseJudgeLock();

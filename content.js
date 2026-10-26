@@ -11,7 +11,11 @@
   const site = A.bySite(location.hostname);
   if (!site) return;
 
-  const diagnosticVersion = 'send-20261014-1';
+  const diagnosticVersion = 'send-20261020-2';
+  let preparedSite = site;
+  const instanceToken = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  let prepareSequence = 0;
+  let preparationId = null;
 
   const answerSignature = (text) => {
     if (!text) return '';
@@ -122,7 +126,15 @@
      * 面板并发 prepare，本站点就绪后立即 fire，不等其他站点。
      */
     if (msg.type === 'prepare') {
+      // 站点可把本轮发送绑定到当前会话和编辑器，防止异步准备期间切到其他聊天。
+      preparedSite = site.createSendContext?.(document, location) || site;
+      const sendSite = preparedSite;
+      const sendPreparationId = preparationId = `${instanceToken}:${++prepareSequence}`;
       const prepareStartedAt = Date.now();
+      if (sendSite.isGenerating?.(document)) {
+        respond({ ok: false, error: '模型仍在生成上一条回答，请等待完成', siteId: site.id });
+        return true;
+      }
       const files = msg.files || [];
       const snapshot = A.answerSnapshot(site, document);
       const previousAnswer = snapshot.text;
@@ -136,7 +148,7 @@
        * 不该让整条消息发不出去，所以只回报 fileError 由面板提示。
        */
       // 注入前先数一遍已有缩略图，之后靠"比基线多了"判断站点收下了文件。
-      const baseline = files.length ? A.countChips(site, document) : 0;
+      const baseline = files.length ? A.countChips(sendSite, document) : 0;
 
       (async () => {
         let fileError = null;
@@ -144,7 +156,7 @@
         let via = null;
 
         if (files.length) {
-          const r = await A.attachFiles(site, window, document, files,
+          const r = await A.attachFiles(sendSite, window, document, files,
                                        { baseline, verifyMs: msg.verifyMs });
           if (r.ok) {
             attached = r.attached;
@@ -161,12 +173,17 @@
          * 最后只发出图片。即便顺序对了也可能撞上重建，所以填完要回读确认。
          */
         const fillStartedAt = Date.now();
-        const filled = await A.fillInputVerified(site, window, document, msg.text, 4, {
+        const filled = await A.fillInputVerified(sendSite, window, document, msg.text, 4, {
           readyEarly: !files.length,
         });
         const fillMs = Date.now() - fillStartedAt;
         if (!filled.ok) {
           return { ok: false, error: filled.error || '文字未能填入', siteId: site.id };
+        }
+
+        if (Number.isInteger(msg.dispatchToken)) {
+          chrome.runtime.sendMessage({ type: 'site-send-progress', siteId: site.id,
+            dispatchToken: msg.dispatchToken, stage: 'filled' }).catch(() => {});
         }
 
         /*
@@ -180,9 +197,9 @@
           : (msg.armMs || 2500);
         const readyStartedAt = Date.now();
         const [armed, uploaded] = await Promise.all([
-          A.waitSendable(site, document, armTimeout),
+          A.waitSendable(sendSite, document, armTimeout, { allowEnterFallback: !files.length }),
           shouldWaitUpload
-            ? A.waitForUploads(site, document, baseline, attached, msg.uploadMs)
+            ? A.waitForUploads(sendSite, document, baseline, attached, msg.uploadMs)
             : Promise.resolve(true),
         ]);
 
@@ -190,6 +207,7 @@
         if (attached && !uploaded && !fileError) fileError = '未能确认附件上传完成';
         return {
           ok: true,
+          preparationId: sendPreparationId,
           armed,
           attached,
           via,
@@ -207,6 +225,17 @@
     }
 
     if (msg.type === 'fire') {
+      if (msg.preparationId && msg.preparationId !== preparationId) {
+        respond({ ok: false, error: '站点页面或发送内容已更新，请重新发送', siteId: site.id });
+        return true;
+      }
+      const sendSite = preparedSite;
+      try {
+        sendSite.assertSendContext?.();
+      } catch (error) {
+        respond({ ok: false, error: error.message, siteId: site.id });
+        return true;
+      }
       // 在本站点、点击提交之前同步刷新基线，不再为 peek 额外往返后台和面板。
       // 基线读取失败不阻止发送，面板可沿用 prepare 的基线。
       let baseline = {};
@@ -222,12 +251,12 @@
       }
       const respondFired = (result) => respond({ ...result, ...baseline, siteId: site.id });
       if (site.verifySubmit) {
-        A.submitVerified(site, window, document, site.submitVerifyMs)
+        A.submitVerified(sendSite, window, document, site.submitVerifyMs)
           .then(respondFired)
           .catch((e) => respondFired({ ok: false, error: e.message }));
         return true;
       }
-      const r = A.submit(site, window, document);
+      const r = A.submit(sendSite, window, document);
       respondFired(r);
       return true;
     }
